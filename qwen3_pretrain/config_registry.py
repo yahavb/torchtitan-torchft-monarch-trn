@@ -1,4 +1,4 @@
-"""Qwen3-14B pretrained from scratch on c4_test, two trn3-dev1 hosts, with torchft.
+"""Qwen3-14B pretrained from scratch on C4, as torchft replicas on Trainium.
 
 This is the torchft device-taint demo's job (torchft-neuron
 examples/kubernetes/neuron_m1/config_registry.py, Image 14), built on the demo's
@@ -13,6 +13,7 @@ The demo hardcodes its shape (4 hosts x 64 ranks); m1_shape.py resizes it to
 
 from __future__ import annotations
 
+import os
 from dataclasses import fields, replace
 from typing import Any
 
@@ -78,12 +79,25 @@ NeuronFaultTolerantTrainer._publish_frontier = _publish_frontier
 _MAX_STEPS = 10000
 
 
+# The dataset: "c4" (allenai/c4 en, streamed from Hugging Face; default) or
+# "c4_test" (TorchTitan's 2000-document sample in the image: quick tests only; the
+# model memorizes it within a few hundred steps).
+_DATASET = os.environ.get("QWEN3_DATASET", "c4")
+# C4 uses the real Qwen3 tokenizer, fetched at pod start by fetch_tokenizer.sh;
+# c4_test keeps TorchTitan's test tokenizer, resolved against the image's WORKDIR.
+_TOKENIZER = (
+    "./tests/assets/tokenizer"
+    if _DATASET == "c4_test"
+    else os.environ.get("QWEN3_TOKENIZER_DIR", "/tmp/hf/Qwen3-14B")
+)
+
+
 def _config_values(config: Any) -> dict[str, Any]:
     return {item.name: getattr(config, item.name) for item in fields(config)}
 
 
-def qwen3_14b_c4_test() -> NeuronFaultTolerantTrainer.Config:
-    """Qwen3 14B, random init, c4_test, 2 torchft replicas x 16 logical NeuronCores.
+def qwen3_14b_c4() -> NeuronFaultTolerantTrainer.Config:
+    """Qwen3 14B, random init, C4, torchft replicas x 16 logical NeuronCores.
 
     Each pod holds one l-lnc2-trn-efa claim: 4 devices x 4 logical cores = 16 ranks,
     TP4 x FSDP4 inside the pod. Each step the lighthouse names the live replicas
@@ -94,12 +108,9 @@ def qwen3_14b_c4_test() -> NeuronFaultTolerantTrainer.Config:
     values = _config_values(base)
     values.update(
         {
-            # TorchTitan's test tokenizer, resolved against the image's WORKDIR
-            # (/opt/torchtitan). No HF download, no token.
-            "hf_assets_path": "./tests/assets/tokenizer",
-            # torchtitan/tests/assets/c4_test: 2000 English C4 documents, ~4.7 MB.
+            "hf_assets_path": _TOKENIZER,
             "dataloader": HuggingFaceTextDataLoader.Config(
-                dataset="c4_test",
+                dataset=_DATASET,
                 infinite=True,
                 num_workers=0,
             ),

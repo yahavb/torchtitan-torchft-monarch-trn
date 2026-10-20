@@ -62,7 +62,9 @@ Training arguments are the controller's `args` in `controller.yaml` (e.g. `--tra
 
 ## Notes
 
-- The model trains on TorchTitan's tiny `c4_test` sample, so the loss falls far below
-  real pretraining. The workload is realistic in size and communication, not in what it learns.
+- The model trains on C4 (`allenai/c4`, English), streamed from Hugging Face, with the
+  Qwen3 tokenizer; the pods need internet access to huggingface.co. `QWEN3_DATASET=c4_test`
+  switches to TorchTitan's 2000-document sample in the image for quick tests (the model
+  memorizes it within a few hundred steps).
 - The logged loss is torchft's sum over the participating replicas; `METRICS` and
   CloudWatch `Loss` divide it by the quorum size.

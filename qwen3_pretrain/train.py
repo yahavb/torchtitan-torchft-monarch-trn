@@ -14,7 +14,7 @@ from torchtitan.config import ConfigManager
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import init_logger
 
-_DEFAULT_ARGS = ["--module", "qwen3_pretrain", "--config", "qwen3_14b_c4_test"]
+_DEFAULT_ARGS = ["--module", "qwen3_pretrain", "--config", "qwen3_14b_c4"]
 
 
 def main(args: Sequence[str] | None = None) -> None:

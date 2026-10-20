@@ -64,6 +64,7 @@ spec:
         - |
           set -euo pipefail
           bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
+          bash /opt/qwen3-pretrain/qwen3_pretrain/fetch_tokenizer.sh
           # Each pod is its own torchrun world and one torchft replica. The demo's
           # trainer checks this identity (its launcher.py sets it; that launcher
           # hardcodes 64 ranks, so its env setup is done here instead).
@@ -171,6 +172,20 @@ spec:
           value: us-east-2
         - name: AWS_DEFAULT_REGION
           value: us-east-2
+        # Training data: C4 streamed from Hugging Face (QWEN3_DATASET=c4_test for the
+        # tiny in-image sample). The pods need internet access to huggingface.co. An
+        # HF token is optional and only avoids anonymous rate limits:
+        #   kubectl create secret generic hf-token --from-literal=HF_TOKEN=<token>
+        - name: QWEN3_DATASET
+          value: c4
+        - name: HF_HOME
+          value: /tmp/hf-cache
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+              optional: true
         - name: NNODES
           value: "4"
         # A GRADSYNC line every N steps: the same rank in each pod must match.
