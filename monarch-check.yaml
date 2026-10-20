@@ -1,0 +1,73 @@
+# One-off check before adding Monarch: which torch the worker image has, whether
+# monarch is already importable, whether torchmonarch 0.4.1 (the GRPO pin) installs
+# and which image packages (if any) it changes, and whether a tiny Monarch actor runs.
+# Runs on a trn3-dev1 node (where the image is cached), no devices.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monarch-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  containers:
+  - name: check
+    image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+      value: "0"
+    - name: HOME
+      value: /tmp
+    command:
+    - /bin/bash
+    - -c
+    - |
+      PY=/opt/torch-neuronx/.venv/bin/python
+      echo "=== python"; $PY -V
+      echo "=== torch"; $PY -c 'import torch; print(torch.__version__)'
+      echo "=== torch_neuronx"; $PY -c 'import importlib.metadata as m; print(m.version("torch-neuronx"))' 2>&1 | tail -1
+      echo "=== torchft"; $PY -c 'import importlib.metadata as m; print(m.version("torchft"))' 2>&1 | tail -1
+      echo "=== monarch already?"; $PY -c 'import monarch; print("yes", monarch.__file__)' 2>&1 | tail -1
+      echo "=== pip/uv"; $PY -m pip --version 2>&1 | tail -1; command -v uv || echo "no uv"
+      echo "=== install torchmonarch==0.4.1 with deps (already-satisfied image packages are kept)"
+      $PY -m pip list --format=freeze > /tmp/before.txt
+      $PY -m pip install --quiet --root-user-action=ignore torchmonarch==0.4.1 2>&1 | tail -5
+      $PY -m pip list --format=freeze > /tmp/after.txt
+      echo "=== image packages whose version changed (empty = none)"
+      comm -13 <(sort /tmp/before.txt) <(sort /tmp/after.txt) | while read -r line; do
+        name="${line%%==*}"; grep -qi "^${name}==" /tmp/before.txt && echo "CHANGED $line (was $(grep -i "^${name}==" /tmp/before.txt))"
+      done
+      echo "=== newly added packages"; comm -13 <(sort /tmp/before.txt) <(sort /tmp/after.txt) | tr '\n' ' '; echo
+      echo "=== torch unchanged?"; $PY -c 'import torch; print(torch.__version__)'
+      echo "=== mini actor: spawn 2 local procs and call an endpoint"
+      cat > /tmp/mini.py <<'EOF'
+      from monarch.actor import Actor, endpoint, this_host
+
+      class Echo(Actor):
+          @endpoint
+          def rank(self) -> int:
+              import os
+              return int(os.environ.get("RANK", "-1"))
+
+      procs = this_host().spawn_procs(per_host={"procs": 2})
+      echo = procs.spawn("echo", Echo)
+      print("endpoint results:", list(echo.rank.call().get()))
+      print("MONARCH MINI OK")
+      EOF
+      timeout 120 $PY /tmp/mini.py 2>&1 | tail -8
+      echo "=== done"
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi

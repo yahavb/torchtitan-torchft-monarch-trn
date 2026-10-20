@@ -1,0 +1,254 @@
+# Monarch version of job.yaml: four worker pods = four torchft replicas on trn3-dev1.
+# Same devices, env, volumes and readiness as job.yaml, but each pod runs only a
+# Monarch worker and waits for controller.yaml's controller to tell it to train.
+# The controller decides when a replica must restart and marks its pod failed; the
+# liveness probe fails on that mark and Kubernetes restarts the pod.
+# Headless Service at the end: the controller finds pod N at qwen3-workers-N.qwen3-workers.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-workers
+  namespace: default
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  # A dead worker pod is replaced; the controller re-attaches and torchft heals it.
+  backoffLimit: 10000
+  template:
+    metadata:
+      labels:
+        app: qwen3-workers
+    spec:
+      subdomain: qwen3-workers
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # The worker exits on SIGTERM at once (monarch_worker.py); 10 s is a backstop
+      # so a restart the controller asked for is not held up by a slow shutdown.
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        node-type: trn3-dev1
+      affinity:
+        # Spread replicas over hosts, but allow two on one host: each pod is its own
+        # world, so they share nothing on the host except EFA.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: qwen3-workers
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: aws.amazon.com/neuron
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      resourceClaims:
+      - name: accelerators
+        resourceClaimTemplateName: l-lnc2-trn-efa
+      containers:
+      - name: trainer
+        # The torchft demo's worker image (Image 14). Used for its environment only:
+        # torch-neuronx venv, TorchTitan 1ac46539 at /opt/torchtitan (the WORKDIR),
+        # EFA/libfabric, and the Neuron attention adapter. torchft is in it but unused.
+        # Proven on trn2; this is its first use on trn3-dev1.
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          bash /opt/qwen3-pretrain/qwen3_pretrain/install_monarch.sh
+          bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
+          echo "monarch worker for torchft replica ${JOB_COMPLETION_INDEX} of ${NNODES}"
+          exec /opt/torch-neuronx/.venv/bin/python -m qwen3_pretrain.monarch_worker
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: MONARCH_WORKER_PORT
+          value: "26600"
+        # torchft: where the lighthouse is (lighthouse.yaml's Service), and the
+        # address this pod gives its peers.
+        - name: TORCHFT_LIGHTHOUSE
+          value: http://qwen3-lighthouse.default.svc.cluster.local:29510
+        - name: TORCHFT_ADVERTISED_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # torchft timeouts, as in the demo.
+        - name: TORCHFT_TIMEOUT_SEC
+          value: "120"
+        - name: TORCHFT_QUORUM_TIMEOUT_SEC
+          value: "600"
+        - name: TORCHFT_CONNECT_TIMEOUT_SEC
+          value: "60"
+        - name: TORCHFT_QUORUM_RETRIES
+          value: "2"
+        # The demo trainer's identity checks (examples/kubernetes/neuron_m1/trainer.py).
+        # Must match config_registry: 4 replicas, quorum floor 3, 16 ranks per pod.
+        - name: TORCHFT_NEURON_M1_RUN_ID
+          value: torchft-neuron-qwen3-pretrain
+        - name: TORCHFT_NEURON_M1_INITIAL_REPLICAS
+          value: "4"
+        - name: TORCHFT_NEURON_M1_MIN_REPLICAS
+          value: "3"
+        - name: TORCHFT_NEURON_TRANSPORT_STRIDE
+          value: "16"
+        - name: TORCHFT_NEURON_MAX_GENERATIONS
+          value: "65536"
+        - name: TORCHFT_NEURON_M1_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: TORCHFT_NEURON_M1_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # Pod count = number of torchft replicas (config_registry reads it).
+        # Replica id = pod index; the controller passes it to the training processes.
+        # Training metrics to CloudWatch (qwen3_pretrain/cloudwatch.py), sent by each
+        # replica's rank 0 with the node's IAM role. Unset CW_NAMESPACE to turn off.
+        - name: CW_NAMESPACE
+          value: Qwen3/TorchFT
+        - name: CW_RUN_ID
+          value: qwen3-pretrain
+        - name: AWS_REGION
+          value: us-east-2
+        - name: AWS_DEFAULT_REGION
+          value: us-east-2
+        - name: NNODES
+          value: "4"
+        # A GRADSYNC line every N steps: the same rank in each pod must match.
+        - name: GRADSYNC_LOG_EVERY
+          value: "10"
+        - name: PYTHONPATH
+          value: /opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/monarch-pkgs:/tmp/cw-pkgs
+        # One rank per logical NeuronCore: 4 devices x 8 cores / LNC 2 = 16.
+        # NEURON_RT_VISIBLE_CORES is deliberately unset: the DRA claim decides which
+        # cores the container sees, and torch-neuronx pins each rank to its own.
+        - name: NEURON_LOGICAL_NC_CONFIG
+          value: "2"
+        # Loads torch_neuronx in every rank, which registers the "neuron" compile backend.
+        - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+          value: "1"
+        # 256 MiB allocator split cap: the demo's fix for device-memory growth.
+        - name: TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG
+          value: kMaxSplitSizeBytes=268435456
+        - name: TORCH_NEURONX_LOG_LEVEL
+          value: "2"
+        # Cross-node collectives over EFA.
+        - name: FI_PROVIDER
+          value: efa
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+        - name: FI_EFA_ENABLE_SHM_TRANSFER
+          value: "0"
+        - name: CCOM_SOCKET_IFNAME
+          value: eth0
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: MKL_NUM_THREADS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: HOME
+          value: /tmp/home
+        # Startup: the Monarch worker is listening (it installs Monarch first, a few
+        # seconds). Liveness is the controller's decision: it fails once the controller
+        # marks this pod failed (a crashed or hung replica), and Kubernetes restarts the
+        # pod. Readiness is per pod, as in job.yaml: ready while THIS replica keeps
+        # finishing steps; not ready while it compiles or heals, or once marked failed.
+        startupProbe:
+          tcpSocket:
+            port: monarch
+          periodSeconds: 2
+          failureThreshold: 150
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test ! -e /run/torchft-neuron-m1/qwen3-failed"]
+          periodSeconds: 5
+          failureThreshold: 2
+        readinessProbe:
+          exec:
+            # Per-pod: ready while THIS replica keeps finishing steps (readiness.py).
+            command: ["/opt/torch-neuronx/.venv/bin/python", "/opt/qwen3-pretrain/qwen3_pretrain/readiness.py"]
+          periodSeconds: 5
+          failureThreshold: 2
+          timeoutSeconds: 10
+        ports:
+        - name: monarch
+          containerPort: 26600
+        resources:
+          claims:
+          - name: accelerators
+          # Proportional to the claim: 4 of the node's 16 Neuron devices = 1/4 of its
+          # allocatable (trn3-dev1: 191450m CPU, 2004269Mi memory, 1842Gi ephemeral),
+          # rounded down.
+          requests:
+            cpu: "47"
+            memory: 489Gi
+            ephemeral-storage: 460Gi
+          limits:
+            cpu: "47"
+            memory: 489Gi
+            ephemeral-storage: 460Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: code
+          mountPath: /opt/qwen3-pretrain/qwen3_pretrain
+          readOnly: true
+        # The demo trainer writes its per-step status (frontier.py) here; the
+        # demo mounts the same emptyDir.
+        - name: runtime
+          mountPath: /run/torchft-neuron-m1
+        # torch-neuronx keeps its NEFF/HLO compile caches under /tmp by default.
+        - name: scratch
+          mountPath: /tmp
+        - name: dev-shm
+          mountPath: /dev/shm
+      volumes:
+      - name: code
+        configMap:
+          name: qwen3-pretrain-code
+      - name: runtime
+        emptyDir: {}
+      - name: scratch
+        emptyDir:
+          sizeLimit: 400Gi
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-workers
+  namespace: default
+spec:
+  clusterIP: None
+  # The controller attaches before the pods are ready (they become ready by training).
+  publishNotReadyAddresses: true
+  selector:
+    app: qwen3-workers
+  ports:
+  - name: monarch
+    port: 26600

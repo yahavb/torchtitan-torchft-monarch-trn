@@ -1,0 +1,15 @@
+# Headless Service: gives the Indexed Job's pods stable DNS names,
+# qwen3-pretrain-<index>.qwen3-pretrain, so node 1 can find node 0's torchrun store.
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-pretrain
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: qwen3-pretrain
+  ports:
+  - name: rendezvous
+    port: 29500

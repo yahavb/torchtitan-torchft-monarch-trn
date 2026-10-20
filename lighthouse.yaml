@@ -1,0 +1,82 @@
+# torchft lighthouse: the quorum coordinator. Each replica's rank 0 heartbeats here
+# and asks, every step, which replicas are alive. It holds no training state.
+# Same image and flags as the torchft demo: 4 replicas, keep training with 3.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-lighthouse
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qwen3-lighthouse
+  template:
+    metadata:
+      labels:
+        app: qwen3-lighthouse
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: lighthouse
+        # The demo's lighthouse image.
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:e7e02eeb8e4ba7175170e6ff51a4fa870a5d253b1c342113497a37305d97a3f9
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/torch-neuronx/.venv/bin/torchft_lighthouse"]
+        args:
+        # Keep training with 3 of 4 replicas; wait for 4 at start.
+        - --min_replicas
+        - "3"
+        - --initial_replicas
+        - "4"
+        - --quorum_tick_ms
+        - "100"
+        - --join_timeout_ms
+        - "20000"
+        - --bind
+        - "[::]:29510"
+        env:
+        # No Neuron devices here: don't load torch_neuronx.
+        - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+          value: "0"
+        ports:
+        - name: http
+          containerPort: 29510
+        readinessProbe:
+          tcpSocket:
+            port: http
+          periodSeconds: 2
+          failureThreshold: 30
+        resources:
+          requests:
+            cpu: "1"
+            memory: 1Gi
+          limits:
+            cpu: "4"
+            memory: 4Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+---
+# Workers reach it at http://qwen3-lighthouse.default.svc.cluster.local:29510
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-lighthouse
+  namespace: default
+spec:
+  selector:
+    app: qwen3-lighthouse
+  ports:
+  - name: http
+    port: 29510
+    targetPort: http

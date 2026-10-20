@@ -1,0 +1,284 @@
+# Four pods = four torchft replicas on trn3-dev1. Each pod is its own 16-rank
+# torchrun world; torchft (via lighthouse.yaml) averages gradients across the pods
+# and lets one die and rejoin while the others keep training.
+# Each pod takes a 4-device slice of its host (l-lnc2-trn-efa), like the GRPO pods.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-pretrain
+  namespace: default
+spec:
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  # A dead replica's pod is replaced and rejoins (torchft); the demo used 10000.
+  backoffLimit: 10000
+  template:
+    metadata:
+      labels:
+        app: qwen3-pretrain
+    spec:
+      subdomain: qwen3-pretrain
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 90
+      nodeSelector:
+        node-type: trn3-dev1
+      affinity:
+        # Spread replicas over hosts, but allow two on one host: each pod is its own
+        # world, so they share nothing on the host except EFA.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: qwen3-pretrain
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+      - key: aws.amazon.com/neuron
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      resourceClaims:
+      - name: accelerators
+        resourceClaimTemplateName: l-lnc2-trn-efa
+      containers:
+      - name: trainer
+        # The torchft demo's worker image (Image 14). Used for its environment only:
+        # torch-neuronx venv, TorchTitan 1ac46539 at /opt/torchtitan (the WORKDIR),
+        # EFA/libfabric, and the Neuron attention adapter. torchft is in it but unused.
+        # Proven on trn2; this is its first use on trn3-dev1.
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
+          # Each pod is its own torchrun world and one torchft replica. The demo's
+          # trainer checks this identity (its launcher.py sets it; that launcher
+          # hardcodes 64 ranks, so its env setup is done here instead).
+          IDX="${JOB_COMPLETION_INDEX}"
+          export TORCHFT_NEURON_M1_LOGICAL_SLOT="$IDX"
+          export TORCHFT_NEURON_M1_REPLICA_ID="torchft-neuron-m1-replica-$IDX"
+          export TORCHFT_NEURON_TRANSPORT_SLOT="$IDX"
+          export TORCHFT_NEURON_M1_WORKER_INCARNATION="$(tr -d - </proc/sys/kernel/random/uuid)"
+          export TORCHFT_NEURON_M1_PROCESS_INCARNATION="$(tr -d - </proc/sys/kernel/random/uuid)"
+          export TORCHFT_LOCAL_STORE_GENERATION="${TORCHFT_NEURON_M1_POD_UID}:${TORCHFT_NEURON_M1_WORKER_INCARNATION}:${TORCHFT_NEURON_M1_PROCESS_INCARNATION}"
+          echo "torchft replica ${IDX} of ${NNODES}, lighthouse ${TORCHFT_LIGHTHOUSE}"
+          # The demo launcher's launch claim (/run/torchft-neuron-m1/launch.json),
+          # written by its own claim_launch(); the trainer reads it back.
+          /opt/torch-neuronx/.venv/bin/python -c '
+          import os
+          from examples.kubernetes.neuron_m1.launcher import DEFAULT_SENTINEL, claim_launch
+          e = os.environ
+          assert claim_launch(
+              DEFAULT_SENTINEL,
+              pod_uid=e["TORCHFT_NEURON_M1_POD_UID"],
+              run_id=e["TORCHFT_NEURON_M1_RUN_ID"],
+              worker_incarnation=e["TORCHFT_NEURON_M1_WORKER_INCARNATION"],
+              process_incarnation=e["TORCHFT_NEURON_M1_PROCESS_INCARNATION"],
+          ), "launch claim already exists"
+          '
+          # As under the demo launcher: this shell stays PID 1 and torchrun runs as
+          # its child in its own session; the child's PID goes in the PID file
+          # (written by the launcher's own _write_pid), which the probes read.
+          setsid /opt/torch-neuronx/.venv/bin/torchrun \
+            --standalone \
+            --nnodes=1 \
+            --nproc_per_node=16 \
+            --max_restarts=0 \
+            --log-dir=/tmp/torchrun-logs \
+            --redirects=3 \
+            --tee=0:3 \
+            --local-ranks-filter=0 \
+            /opt/qwen3-pretrain/qwen3_pretrain/train.py "$@" &
+          CHILD=$!
+          /opt/torch-neuronx/.venv/bin/python -c '
+          import sys
+          from examples.kubernetes.neuron_m1.launcher import DEFAULT_PID_FILE, _write_pid
+          _write_pid(DEFAULT_PID_FILE, int(sys.argv[1]))
+          ' "$CHILD"
+          # Pass a pod stop (SIGTERM, e.g. an eviction) to torchrun's whole group,
+          # then exit with torchrun's status.
+          trap 'kill -TERM -- "-$CHILD" 2>/dev/null || true' TERM INT
+          set +e
+          RC=0
+          while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; RC=$?; done
+          exit "$RC"
+        - torchrun
+        # Extra args go to TorchTitan's CLI. Long enough to watch it converge and
+        # inject a fault (~5.5 s/step at 4 replicas: 5000 steps is ~8 h).
+        args: ["--training.steps", "5000"]
+        env:
+        - name: JOB_NAME
+          value: qwen3-pretrain
+        # torchft: where the lighthouse is (lighthouse.yaml's Service), and the
+        # address this pod gives its peers.
+        - name: TORCHFT_LIGHTHOUSE
+          value: http://qwen3-lighthouse.default.svc.cluster.local:29510
+        - name: TORCHFT_ADVERTISED_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # torchft timeouts, as in the demo.
+        - name: TORCHFT_TIMEOUT_SEC
+          value: "120"
+        - name: TORCHFT_QUORUM_TIMEOUT_SEC
+          value: "600"
+        - name: TORCHFT_CONNECT_TIMEOUT_SEC
+          value: "60"
+        - name: TORCHFT_QUORUM_RETRIES
+          value: "2"
+        # The demo trainer's identity checks (examples/kubernetes/neuron_m1/trainer.py).
+        # Must match config_registry: 4 replicas, quorum floor 3, 16 ranks per pod.
+        - name: TORCHFT_NEURON_M1_RUN_ID
+          value: torchft-neuron-qwen3-pretrain
+        - name: TORCHFT_NEURON_M1_INITIAL_REPLICAS
+          value: "4"
+        - name: TORCHFT_NEURON_M1_MIN_REPLICAS
+          value: "3"
+        - name: TORCHFT_NEURON_TRANSPORT_STRIDE
+          value: "16"
+        - name: TORCHFT_NEURON_MAX_GENERATIONS
+          value: "65536"
+        - name: TORCHFT_NEURON_M1_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: TORCHFT_NEURON_M1_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        # Pod count = number of torchft replicas (config_registry reads it).
+        # Replica id = JOB_COMPLETION_INDEX, set by the Indexed Job.
+        # Training metrics to CloudWatch (qwen3_pretrain/cloudwatch.py), sent by each
+        # replica's rank 0 with the node's IAM role. Unset CW_NAMESPACE to turn off.
+        - name: CW_NAMESPACE
+          value: Qwen3/TorchFT
+        - name: CW_RUN_ID
+          value: qwen3-pretrain
+        - name: AWS_REGION
+          value: us-east-2
+        - name: AWS_DEFAULT_REGION
+          value: us-east-2
+        - name: NNODES
+          value: "4"
+        # A GRADSYNC line every N steps: the same rank in each pod must match.
+        - name: GRADSYNC_LOG_EVERY
+          value: "10"
+        - name: PYTHONPATH
+          value: /opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/cw-pkgs
+        # One rank per logical NeuronCore: 4 devices x 8 cores / LNC 2 = 16.
+        # NEURON_RT_VISIBLE_CORES is deliberately unset: the DRA claim decides which
+        # cores the container sees, and torch-neuronx pins each rank to its own.
+        - name: NEURON_LOGICAL_NC_CONFIG
+          value: "2"
+        # Loads torch_neuronx in every rank, which registers the "neuron" compile backend.
+        - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+          value: "1"
+        # 256 MiB allocator split cap: the demo's fix for device-memory growth.
+        - name: TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG
+          value: kMaxSplitSizeBytes=268435456
+        - name: TORCH_NEURONX_LOG_LEVEL
+          value: "2"
+        # Cross-node collectives over EFA.
+        - name: FI_PROVIDER
+          value: efa
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_EFA_FORK_SAFE
+          value: "1"
+        - name: FI_EFA_ENABLE_SHM_TRANSFER
+          value: "0"
+        - name: CCOM_SOCKET_IFNAME
+          value: eth0
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: MKL_NUM_THREADS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        - name: HOME
+          value: /tmp/home
+        # The demo's probes. Startup and liveness: torchrun is alive (its PID file).
+        # Readiness is per pod: ready while THIS replica keeps finishing steps (a
+        # heartbeat per step), so survivors stay ready through another replica's
+        # failure and a replacement is not ready until it has healed and stepped.
+        startupProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test -s /run/torchft-neuron-m1/torchrun.pid && kill -0 \"$(cat /run/torchft-neuron-m1/torchrun.pid)\""]
+          periodSeconds: 2
+          failureThreshold: 150
+          timeoutSeconds: 2
+        livenessProbe:
+          exec:
+            command: ["/bin/sh", "-c", "test -s /run/torchft-neuron-m1/torchrun.pid && kill -0 \"$(cat /run/torchft-neuron-m1/torchrun.pid)\""]
+          periodSeconds: 10
+          failureThreshold: 3
+          timeoutSeconds: 2
+        readinessProbe:
+          exec:
+            # Per-pod: ready while THIS replica keeps finishing steps (readiness.py).
+            command: ["/opt/torch-neuronx/.venv/bin/python", "/opt/qwen3-pretrain/qwen3_pretrain/readiness.py"]
+          periodSeconds: 5
+          failureThreshold: 2
+          timeoutSeconds: 10
+        ports:
+        - name: rendezvous
+          containerPort: 29500
+        resources:
+          claims:
+          - name: accelerators
+          # Proportional to the claim: 4 of the node's 16 Neuron devices = 1/4 of its
+          # allocatable (trn3-dev1: 191450m CPU, 2004269Mi memory, 1842Gi ephemeral),
+          # rounded down.
+          requests:
+            cpu: "47"
+            memory: 489Gi
+            ephemeral-storage: 460Gi
+          limits:
+            cpu: "47"
+            memory: 489Gi
+            ephemeral-storage: 460Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: code
+          mountPath: /opt/qwen3-pretrain/qwen3_pretrain
+          readOnly: true
+        # The demo trainer writes its per-step status (frontier.py) here; the
+        # demo mounts the same emptyDir.
+        - name: runtime
+          mountPath: /run/torchft-neuron-m1
+        # torch-neuronx keeps its NEFF/HLO compile caches under /tmp by default.
+        - name: scratch
+          mountPath: /tmp
+        - name: dev-shm
+          mountPath: /dev/shm
+      volumes:
+      - name: code
+        configMap:
+          name: qwen3-pretrain-code
+      - name: runtime
+        emptyDir: {}
+      - name: scratch
+        emptyDir:
+          sizeLimit: 400Gi
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
