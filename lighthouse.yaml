@@ -30,7 +30,23 @@ spec:
         # The demo's lighthouse image.
         image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:e7e02eeb8e4ba7175170e6ff51a4fa870a5d253b1c342113497a37305d97a3f9
         imagePullPolicy: IfNotPresent
-        command: ["/opt/torch-neuronx/.venv/bin/torchft_lighthouse"]
+        # The pod log is a summary (qwen3_pretrain/lighthouse_log.py): a line per
+        # membership change and a steady line every 100 quorums, without the
+        # per-request "New quorum not ready" chatter. Full raw log in the pod:
+        #   kubectl exec deploy/qwen3-lighthouse -- cat /tmp/lighthouse/raw.log
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -o pipefail
+          FILTER=/opt/qwen3-pretrain/qwen3_pretrain/lighthouse_log.py
+          # A missing filter (ConfigMap not updated) must not take the lighthouse down:
+          # fall back to the plain log.
+          if [ -f "$FILTER" ]; then SUMMARY=(/opt/torch-neuronx/.venv/bin/python -u "$FILTER"); else SUMMARY=(cat); fi
+          /opt/torch-neuronx/.venv/bin/torchft_lighthouse "$@" 2>&1 \
+            | tee -a /tmp/lighthouse/raw.log \
+            | "${SUMMARY[@]}"
+        - lighthouse
         args:
         # Keep training with 3 of 4 replicas; wait for 4 at start.
         - --min_replicas
@@ -47,6 +63,12 @@ spec:
         # No Neuron devices here: don't load torch_neuronx.
         - name: TORCH_DEVICE_BACKEND_AUTOLOAD
           value: "0"
+        volumeMounts:
+        - name: code
+          mountPath: /opt/qwen3-pretrain/qwen3_pretrain
+          readOnly: true
+        - name: raw-log
+          mountPath: /tmp/lighthouse
         ports:
         - name: http
           containerPort: 29510
@@ -66,6 +88,13 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+      volumes:
+      - name: code
+        configMap:
+          name: qwen3-pretrain-code
+      - name: raw-log
+        emptyDir:
+          sizeLimit: 2Gi
 ---
 # Workers reach it at http://qwen3-lighthouse.default.svc.cluster.local:29510
 apiVersion: v1
