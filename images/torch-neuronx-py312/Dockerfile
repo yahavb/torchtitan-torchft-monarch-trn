@@ -42,9 +42,11 @@ RUN /opt/py312/bin/python -m pip install --no-cache-dir \
        "torchmonarch==${TORCHMONARCH_VERSION}"
 
 # Fail the build unless 3.12 has everything this repo needs. No Neuron device during
-# a build: keep torch from auto-loading torch-neuronx for these checks.
+# a build: keep torch from auto-loading torch-neuronx, and only locate torch_neuronx
+# (importing it needs a device; checks/py312-build-check.yaml imports it with one).
 RUN export TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-    && PYTHONPATH=/workspace/torch_neuronx /opt/py312/bin/python -c "import torch, monarch.actor, neuronxcc, torch_neuronx; print('torch', torch.__version__)" \
+    && /opt/py312/bin/python -c "import torch, monarch.actor, neuronxcc; print('torch', torch.__version__)" \
+    && PYTHONPATH=/workspace/torch_neuronx /opt/py312/bin/python -c "import importlib.util as u; s = u.find_spec('torch_neuronx'); assert s, 'torch_neuronx not on the 3.12 path'; print('torch_neuronx at', s.origin)" \
     && /opt/py312/bin/python -c "import torch; assert torch.__version__.startswith('${TORCH_VERSION}'), torch.__version__"
 
 WORKDIR /workspace
