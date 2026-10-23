@@ -1,0 +1,153 @@
+# One-off check: can the public Neuron image run this repo's torchft training?
+# Prints, from the image itself: Python, torch, torch-neuronx; whether torch-neuronx
+# has the Neuron RDMA backend torchft's ProcessGroupNeuron needs; whether torchft
+# (rpsilva-aws/torchft, the Neuron fork, pinned) builds and imports; and whether
+# TorchTitan at the demo's pin imports. Uses one Neuron device (its own claim
+# template below), so torch-neuronx's device-dependent modules can be imported.
+# Needs the github-token secret (key GITHUB_TOKEN) for the private torchft fork.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: one-neuron-device
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: neuron
+        exactly:
+          deviceClassName: neuron.aws.com
+          allocationMode: ExactCount
+          count: 1
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: public-image-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  resourceClaims:
+  - name: neuron
+    resourceClaimTemplateName: one-neuron-device
+  containers:
+  - name: check
+    image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: TORCHFT_REPO
+      value: rpsilva-aws/torchft
+    - name: TORCHFT_REF
+      value: 5dda86759519
+    - name: TORCHTITAN_REF
+      value: 1ac4653915db
+    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+      value: "0"
+    # Scratch pod: let pip install into the image's Python even if it is the system one.
+    - name: PIP_BREAK_SYSTEM_PACKAGES
+      value: "1"
+    - name: GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: github-token
+          key: GITHUB_TOKEN
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -u
+      step() { echo; echo "=== $*"; }
+      step "python"
+      for p in /opt/torch-neuronx/.venv/bin/python $(command -v python3) $(command -v python); do
+        [ -x "$p" ] && echo "$p: $($p -V 2>&1)"
+      done
+      PY=/opt/torch-neuronx/.venv/bin/python; [ -x "$PY" ] || PY=$(command -v python3)
+      echo "using $PY"
+      step "versions"
+      $PY - <<'EOF'
+      import importlib.metadata as m
+      for name in ("torch", "torch-neuronx", "torchft", "torchtitan", "torchmonarch", "numpy", "datasets", "huggingface_hub", "boto3"):
+          try:
+              print(f"{name}: {m.version(name)}")
+          except m.PackageNotFoundError:
+              print(f"{name}: NOT INSTALLED")
+      EOF
+      step "Neuron RDMA backend in torch-neuronx, from its files (importing it needs a device)"
+      TNX=$($PY -c 'import importlib.util, os; print(os.path.dirname(importlib.util.find_spec("torch_neuronx").origin))')
+      echo "torch_neuronx at $TNX"
+      ls "$TNX/distributed" 2>&1 | tr '\n' ' '; echo
+      grep -rln "def create_neuron_cpp_backend" "$TNX" 2>/dev/null || echo "create_neuron_cpp_backend: not defined in any .py"
+      for so in $(find "$TNX" -name "*.so"); do
+        for sym in create_neuron_cpp_backend _start_coalescing _end_coalescing NeuronWork RdmaManager efa-rdm-device-write-mr-abort; do
+          grep -a -q -- "$sym" "$so" 2>/dev/null && echo "  $(basename "$so"): has $sym"
+        done
+      done
+      step "Neuron RDMA backend, imported (with a device)"
+      TORCH_DEVICE_BACKEND_AUTOLOAD=1 $PY - <<'EOF'
+      try:
+          from torch_neuronx.distributed.cpp_backend import create_neuron_cpp_backend
+          print("create_neuron_cpp_backend: FOUND", create_neuron_cpp_backend)
+          import inspect
+          try:
+              print("  signature:", inspect.signature(create_neuron_cpp_backend))
+          except (TypeError, ValueError):
+              print("  signature: (native)", getattr(create_neuron_cpp_backend, "__doc__", "")[:300])
+      except Exception as e:
+          print("create_neuron_cpp_backend: MISSING", type(e).__name__, e)
+      try:
+          import torch_neuronx._C as C
+          for n in dir(C):
+              cls = getattr(C, n)
+              ms = [x for x in ("send", "recv", "_start_coalescing", "_end_coalescing", "abort") if hasattr(cls, x)]
+              if ms:
+                  print(f"  torch_neuronx._C.{n} has: {ms}")
+      except Exception as e:
+          print("torch_neuronx._C:", type(e).__name__, e)
+      EOF
+      step "tools"
+      for t in git curl gcc cc protoc cargo rustc; do printf '%s: ' "$t"; command -v "$t" || echo "none"; done
+      step "build torchft from $TORCHFT_REPO @ $TORCHFT_REF"
+      cd /tmp
+      git clone -q "https://x-access-token:${GITHUB_TOKEN}@github.com/${TORCHFT_REPO}.git" torchft 2>&1 | tail -2
+      (cd torchft && git checkout -q "$TORCHFT_REF" && git log --oneline -1)
+      if ! command -v cargo >/dev/null; then
+        curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/tmp/rustup.log 2>&1 || tail -3 /tmp/rustup.log
+        . "$HOME/.cargo/env" 2>/dev/null || true
+      fi
+      cargo --version 2>&1 | tail -1
+      if ! command -v protoc >/dev/null; then
+        # protoc from its GitHub release (torchft's Rust build compiles .proto files).
+        curl -sSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+          && $PY -c 'import zipfile; zipfile.ZipFile("/tmp/protoc.zip").extractall("/tmp/protoc")' \
+          && chmod +x /tmp/protoc/bin/protoc && export PATH="/tmp/protoc/bin:$PATH"
+      fi
+      echo "protoc: $(protoc --version 2>&1)"
+      # PyO3 0.24 (torchft's Rust-Python bridge) stops at Python 3.13; build against
+      # the stable ABI instead.
+      export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+      grep -n "^pyo3\|pyo3 = " torchft/Cargo.toml
+      time $PY -m pip install --no-deps -v ./torchft > /tmp/torchft-build.log 2>&1; echo "pip rc=$?"
+      echo "--- build errors:"; grep -n -i -E "error|failed|panicked|could not" /tmp/torchft-build.log | head -25
+      echo "--- build tail:"; tail -15 /tmp/torchft-build.log
+      $PY -c 'import torchft, torchft.neuron; print("torchft import OK", torchft.__file__); print("ProcessGroupNeuron:", torchft.neuron.ProcessGroupNeuron)' 2>&1 | tail -3
+      step "TorchTitan @ $TORCHTITAN_REF"
+      git clone -q https://github.com/pytorch/torchtitan.git /tmp/torchtitan && (cd /tmp/torchtitan && git checkout -q "$TORCHTITAN_REF" && git log --oneline -1)
+      PYTHONPATH=/tmp/torchtitan $PY -c 'import torchtitan, torchtitan.experiments.torchft.trainer as t; print("torchtitan import OK", t.FaultTolerantTrainer)' 2>&1 | tail -3
+      step "done"
+    resources:
+      claims:
+      - name: neuron
+      requests:
+        cpu: "8"
+        memory: 32Gi
+      limits:
+        cpu: "16"
+        memory: 64Gi

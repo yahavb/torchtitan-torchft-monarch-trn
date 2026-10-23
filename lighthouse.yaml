@@ -1,6 +1,8 @@
 # torchft lighthouse: the quorum coordinator. Each replica's rank 0 heartbeats here
 # and asks, every step, which replicas are alive. It holds no training state.
-# Same image and flags as the torchft demo: 4 replicas, keep training with 3.
+# Same flags as the torchft demo: 4 replicas, keep training with 3. This repo's image
+# (images/torch-neuronx-py312); the lighthouse program comes from torchft, built by
+# the deps init container.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,10 +27,49 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      # torchft (with torchft_lighthouse), pinned, built into the deps volume
+      # (qwen3_pretrain/build_deps.sh torchft, ~1 min).
+      initContainers:
+      - name: deps
+        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/opt/qwen3-pretrain/qwen3_pretrain/build_deps.sh", "torchft"]
+        env:
+        - name: TORCHFT_REPO
+          value: rpsilva-aws/torchft
+        - name: TORCHFT_REF
+          value: 5dda86759519
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-token
+              key: GITHUB_TOKEN
+        - name: DEPS
+          value: /deps
+        - name: HOME
+          value: /tmp/home
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          limits:
+            cpu: "8"
+            memory: 16Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: code
+          mountPath: /opt/qwen3-pretrain/qwen3_pretrain
+          readOnly: true
+        - name: deps
+          mountPath: /deps
+        - name: build
+          mountPath: /tmp
       containers:
       - name: lighthouse
-        # The demo's lighthouse image.
-        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:e7e02eeb8e4ba7175170e6ff51a4fa870a5d253b1c342113497a37305d97a3f9
+        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
         imagePullPolicy: IfNotPresent
         # The pod log is a summary (qwen3_pretrain/lighthouse_log.py): a line per
         # membership change and a steady line every 100 quorums, without the
@@ -42,8 +83,9 @@ spec:
           FILTER=/opt/qwen3-pretrain/qwen3_pretrain/lighthouse_log.py
           # A missing filter (ConfigMap not updated) must not take the lighthouse down:
           # fall back to the plain log.
-          if [ -f "$FILTER" ]; then SUMMARY=(/opt/torch-neuronx/.venv/bin/python -u "$FILTER"); else SUMMARY=(cat); fi
-          /opt/torch-neuronx/.venv/bin/torchft_lighthouse "$@" 2>&1 \
+          if [ -f "$FILTER" ]; then SUMMARY=(/opt/py312/bin/python -u "$FILTER"); else SUMMARY=(cat); fi
+          export PYTHONPATH="/deps/site${PYTHONPATH:+:$PYTHONPATH}"
+          /deps/site/bin/torchft_lighthouse "$@" 2>&1 \
             | tee -a /tmp/lighthouse/raw.log \
             | "${SUMMARY[@]}"
         - lighthouse
@@ -69,6 +111,9 @@ spec:
           readOnly: true
         - name: raw-log
           mountPath: /tmp/lighthouse
+        - name: deps
+          mountPath: /deps
+          readOnly: true
         ports:
         - name: http
           containerPort: 29510
@@ -95,6 +140,12 @@ spec:
       - name: raw-log
         emptyDir:
           sizeLimit: 2Gi
+      - name: deps
+        emptyDir:
+          sizeLimit: 2Gi
+      - name: build
+        emptyDir:
+          sizeLimit: 10Gi
 ---
 # Workers reach it at http://qwen3-lighthouse.default.svc.cluster.local:29510
 apiVersion: v1

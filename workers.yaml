@@ -1,5 +1,5 @@
 # Monarch version of job.yaml: four worker pods = four torchft replicas on trn3-dev1.
-# Same devices, env, volumes and readiness as job.yaml, but each pod runs only a
+# Same image, deps, devices, env and readiness as job.yaml, but each pod runs only a
 # Monarch worker and waits for controller.yaml's controller to tell it to train.
 # The controller decides when a replica must restart and marks its pod failed; the
 # liveness probe fails on that mark and Kubernetes restarts the pod.
@@ -54,25 +54,76 @@ spec:
       resourceClaims:
       - name: accelerators
         resourceClaimTemplateName: l-lnc2-trn-efa
+      # The image has torch + torch-neuronx (with the Neuron RDMA backend) but not
+      # torchft, the demo trainer or TorchTitan: this builds them, pinned, into the
+      # shared deps volume (qwen3_pretrain/build_deps.sh, ~1-2 min).
+      initContainers:
+      - name: deps
+        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/bash", "/opt/qwen3-pretrain/qwen3_pretrain/build_deps.sh", "all"]
+        env:
+        - name: TORCHFT_REPO
+          value: rpsilva-aws/torchft
+        - name: TORCHFT_REF
+          value: 5dda86759519
+        - name: TORCHTITAN_REF
+          value: 1ac4653915db
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: github-token
+              key: GITHUB_TOKEN
+        - name: DEPS
+          value: /deps
+        - name: HOME
+          value: /tmp/home
+        resources:
+          requests:
+            cpu: "16"
+            memory: 32Gi
+          limits:
+            cpu: "16"
+            memory: 32Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: code
+          mountPath: /opt/qwen3-pretrain/qwen3_pretrain
+          readOnly: true
+        - name: deps
+          mountPath: /deps
+        - name: scratch
+          mountPath: /tmp
       containers:
       - name: trainer
         # The torchft demo's worker image (Image 14). Used for its environment only:
         # torch-neuronx venv, TorchTitan 1ac46539 at /opt/torchtitan (the WORKDIR),
         # EFA/libfabric, and the Neuron attention adapter. torchft is in it but unused.
         # Proven on trn2; this is its first use on trn3-dev1.
-        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
         imagePullPolicy: IfNotPresent
+        # TorchTitan resolves its test assets relative to its checkout.
+        workingDir: /deps/torchtitan
         command:
         - /bin/bash
         - -c
         - |
           set -euo pipefail
-          bash /opt/qwen3-pretrain/qwen3_pretrain/install_monarch.sh
+          # This repo's code, the demo trainer, TorchTitan and torchft (deps init
+          # container), torch-neuronx (built for Python 3.12 in place in the image's
+          # source tree), then CloudWatch's boto3; ahead of the image's own path. The
+          # training processes Monarch spawns inherit it.
+          export PYTHONPATH="/opt/qwen3-pretrain:/deps/torchft-examples:/deps/torchtitan:/deps/site:/workspace/torch_neuronx:/tmp/cw-pkgs${PYTHONPATH:+:$PYTHONPATH}"
           bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
           bash /opt/qwen3-pretrain/qwen3_pretrain/fetch_tokenizer.sh
           echo "monarch worker for torchft replica ${JOB_COMPLETION_INDEX} of ${NNODES}"
-          exec /opt/torch-neuronx/.venv/bin/python -m qwen3_pretrain.monarch_worker
+          exec "$PY" -m qwen3_pretrain.monarch_worker
         env:
+        - name: PY
+          value: /opt/py312/bin/python
         - name: POD_IP
           valueFrom:
             fieldRef:
@@ -147,15 +198,19 @@ spec:
         # A GRADSYNC line every N steps: the same rank in each pod must match.
         - name: GRADSYNC_LOG_EVERY
           value: "10"
-        - name: PYTHONPATH
-          value: /opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/monarch-pkgs:/tmp/cw-pkgs
         # One rank per logical NeuronCore: 4 devices x 8 cores / LNC 2 = 16.
         # NEURON_RT_VISIBLE_CORES is deliberately unset: the DRA claim decides which
         # cores the container sees, and torch-neuronx pins each rank to its own.
         - name: NEURON_LOGICAL_NC_CONFIG
           value: "2"
-        # Loads torch_neuronx in every rank, which registers the "neuron" compile backend.
+        # Off: Monarch imports torch in each training process before its rank is set.
+        # Each process imports torch_neuronx itself once it has its rank
+        # (replica_actor.py), which registers the "neuron" compile backend.
         - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+          value: "0"
+        # Import the demo trainer (and TorchTitan) only after torch_neuronx is loaded:
+        # TorchTitan picks its device type at import (qwen3_pretrain/__init__.py).
+        - name: QWEN3_DEFER_M1_SHAPE
           value: "1"
         # 256 MiB allocator split cap: the demo's fix for device-memory growth.
         - name: TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG
@@ -201,7 +256,7 @@ spec:
         readinessProbe:
           exec:
             # Per-pod: ready while THIS replica keeps finishing steps (readiness.py).
-            command: ["/opt/torch-neuronx/.venv/bin/python", "/opt/qwen3-pretrain/qwen3_pretrain/readiness.py"]
+            command: ["/opt/py312/bin/python", "/opt/qwen3-pretrain/qwen3_pretrain/readiness.py"]
           periodSeconds: 5
           failureThreshold: 2
           timeoutSeconds: 10
@@ -234,6 +289,9 @@ spec:
         # demo mounts the same emptyDir.
         - name: runtime
           mountPath: /run/torchft-neuron-m1
+        - name: deps
+          mountPath: /deps
+          readOnly: true
         # torch-neuronx keeps its NEFF/HLO compile caches under /tmp by default.
         - name: scratch
           mountPath: /tmp
@@ -245,6 +303,10 @@ spec:
           name: qwen3-pretrain-code
       - name: runtime
         emptyDir: {}
+      # torchft, the demo trainer and TorchTitan, built by the deps init container.
+      - name: deps
+        emptyDir:
+          sizeLimit: 10Gi
       - name: scratch
         emptyDir:
           sizeLimit: 400Gi

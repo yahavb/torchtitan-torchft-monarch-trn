@@ -1,0 +1,91 @@
+# Experiment: Python 3.12 inside the public Neuron DLC (Python 3.14), so Monarch can run.
+# Adds Python 3.12 (deadsnakes), rebuilds torch-neuronx from the source the DLC carries
+# (/workspace/torch_neuronx) for 3.12, installs torch 2.14 (CPU) for 3.12, then checks
+# torch_neuronx and a tiny Monarch actor. Recipe from Arash Jamalian. Runs as root
+# (apt). Uses one Neuron device.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: py312-build-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  resourceClaims:
+  - name: neuron
+    resourceClaimTemplateName: one-neuron-device
+  containers:
+  - name: build
+    image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: DEBIAN_FRONTEND
+      value: noninteractive
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -x
+      step() { set +x; echo; echo "=== $*"; set -x; }
+      step "torch-neuronx source in the DLC"
+      ls /workspace/torch_neuronx | head -30
+      step "Python 3.12 (deadsnakes)"
+      apt-get update -y >/tmp/apt.log 2>&1
+      apt-get install -y sudo wget curl gnupg lsb-release software-properties-common >>/tmp/apt.log 2>&1
+      add-apt-repository -y ppa:deadsnakes/ppa >>/tmp/apt.log 2>&1
+      apt-get update -y >>/tmp/apt.log 2>&1
+      apt-get install -y python3.12 python3.12-dev python3.12-venv >>/tmp/apt.log 2>&1 || tail -20 /tmp/apt.log
+      curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 >/tmp/pip.log 2>&1 || tail -5 /tmp/pip.log
+      python3.12 -V
+      step "Neuron Python packages on the 3.14 side (to mirror on 3.12)"
+      python3 -m pip list --format=freeze 2>/dev/null | grep -i -E "neuron|libnrt|nki" | tee /tmp/neuron-pins.txt
+      step "clean Python 3.12 venv: /opt/py312"
+      python3.12 -m venv /opt/py312
+      P=/opt/py312/bin/python
+      $P -m pip install -q --upgrade pip
+      $P -m pip install -q torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu; echo "torch rc=$?"
+      step "build torch-neuronx for 3.12"
+      cd /workspace/torch_neuronx
+      time ./prerequisites.sh >/tmp/prereq.log 2>&1; echo "prerequisites rc=$?"
+      PYTHON_VERSION=3.12 PATH="/opt/py312/bin:$PATH" ./tools/build --wheel release >/tmp/wheel.log 2>&1; echo "wheel rc=$?"; tail -3 /tmp/wheel.log
+      WHEEL=$(ls -t dist/*cp312*.whl 2>/dev/null | head -1); echo "wheel: $WHEEL"
+      $P -m pip install -q --no-deps "$WHEEL"; echo "torch-neuronx install rc=$?"
+      step "Neuron packages for 3.12, same versions (minus torch-neuronx, built above)"
+      grep -v -i "^torch-neuronx==\|^torch_neuronx==" /tmp/neuron-pins.txt > /tmp/neuron-pins-312.txt
+      $P -m pip install -q --extra-index-url https://pip.repos.neuron.amazonaws.com -r /tmp/neuron-pins-312.txt > /tmp/neuronpkgs.log 2>&1; echo "neuron packages rc=$?"; tail -5 /tmp/neuronpkgs.log
+      $P -m pip list --format=freeze | grep -i -E "^torch|neuron"
+      step "check torch_neuronx on 3.12"
+      $P -c 'import torch, torch_neuronx; print("torch", torch.__version__, "torch_neuronx", torch_neuronx.__version__); from torch_neuronx.distributed.cpp_backend import create_neuron_cpp_backend; print("RDMA backend OK")' 2>&1 | grep -v "ERROR  TDRV\|ERROR   NRT" | tail -5
+      step "Monarch on 3.12"
+      $P -m pip install --pre torchmonarch >/tmp/monarch.log 2>&1; echo "monarch rc=$?"; tail -2 /tmp/monarch.log
+      $P -c 'import torch; print("torch after monarch:", torch.__version__)'
+      cat > /tmp/mini.py <<'EOF'
+      from monarch.actor import Actor, endpoint, this_host
+
+      class Echo(Actor):
+          @endpoint
+          def ok(self) -> int:
+              return 1
+
+      procs = this_host().spawn_procs(per_host={"procs": 2})
+      print("endpoint results:", list(procs.spawn("echo", Echo).ok.call().get()))
+      print("MONARCH MINI OK")
+      EOF
+      TORCH_DEVICE_BACKEND_AUTOLOAD=0 timeout 120 $P /tmp/mini.py 2>&1 | tail -5
+      step "done"
+    resources:
+      claims:
+      - name: neuron
+      requests:
+        cpu: "32"
+        memory: 64Gi
+      limits:
+        cpu: "32"
+        memory: 64Gi

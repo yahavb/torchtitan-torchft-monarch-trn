@@ -5,6 +5,8 @@ interruption and stay ready; the Monarch controller decides the failed one must 
 Kubernetes restarts it, and it rejoins.
 
 Files: `lighthouse.yaml`, `workers.yaml`, `controller.yaml`, `qwen3_pretrain/`.
+Image: this repo's `torch-neuronx-py312` (the public Neuron DLC + Python 3.12 + Monarch).
+The timings below were measured on the earlier internal image (Python 3.12, Monarch 0.4.1).
 
 ## Who detects, who decides, who recovers
 
@@ -26,11 +28,11 @@ Files: `lighthouse.yaml`, `workers.yaml`, `controller.yaml`, `qwen3_pretrain/`.
 - The **lighthouse** (CPU pod) tells the replicas, every step, who is alive.
 
 ```
-kubectl apply -f lighthouse.yaml
 kubectl create configmap qwen3-pretrain-code --from-file=qwen3_pretrain/ --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f lighthouse.yaml
 kubectl apply -f workers.yaml
 kubectl apply -f controller.yaml
-kubectl get po -w            # workers turn 1/1 once step 1 commits (~5 min)
+kubectl get po -w            # deps init (~1-2 min), then 1/1 once step 1 commits
 ```
 
 ## 2. Healthy training (2 min)

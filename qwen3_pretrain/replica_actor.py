@@ -29,6 +29,22 @@ HEARTBEAT = os.path.join(RUN_DIR, "qwen3-heartbeat.json")
 FAILED_MARK = os.path.join(RUN_DIR, "qwen3-failed")
 COMPLETED_MARK = os.path.join(RUN_DIR, "qwen3-training-completed")
 
+# What the deps init container built (workers.yaml), first on the path. Monarch 0.8
+# ships its own top-level `examples` package, which otherwise shadows the demo
+# trainer's examples.kubernetes.neuron_m1 in the processes Monarch spawns.
+_DEPS_PATHS = ("/deps/torchft-examples", "/deps/torchtitan", "/deps/site")
+
+
+def _use_deps_paths() -> None:
+    for path in reversed(_DEPS_PATHS):
+        if path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+    loaded = sys.modules.get("examples")
+    if loaded is not None and not str(getattr(loaded, "__file__", "")).startswith(_DEPS_PATHS[0]):
+        for name in [n for n in sys.modules if n == "examples" or n.startswith("examples.")]:
+            del sys.modules[name]
+
 
 def _identity_env(replica: int, worker_inc: str, process_inc: str) -> dict[str, str]:
     """The demo trainer's per-launch identity (set in job.yaml's command before)."""
@@ -67,6 +83,7 @@ class PodHealth(Actor):
 class ReplicaTrainer(Actor):
     @endpoint
     def prepare(self, replica: int, worker_inc: str, process_inc: str) -> None:
+        _use_deps_paths()
         from examples.kubernetes.neuron_m1.launcher import DEFAULT_SENTINEL, claim_launch
 
         os.environ.update(_identity_env(replica, worker_inc, process_inc))
@@ -93,6 +110,7 @@ class ReplicaTrainer(Actor):
         master_port: int,
         args: list[str],
     ) -> None:
+        _use_deps_paths()
         rank = current_rank().rank
         os.environ.update(_identity_env(replica, worker_inc, process_inc))
         # What torchrun --standalone --nproc_per_node=16 set for each rank.
@@ -109,6 +127,7 @@ class ReplicaTrainer(Actor):
         )
         # Like torchrun --local-ranks-filter 0: only rank 0 prints; the others log
         # to files in the pod.
+        pod_log = os.dup(2)  # the pod log, kept for failures of any rank
         if rank != 0:
             log = os.open(f"/tmp/rank-{rank:02d}.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             os.dup2(log, 1)
@@ -119,9 +138,40 @@ class ReplicaTrainer(Actor):
             with open(os.path.join(RUN_DIR, "train-rank0.pid"), "w") as f:
                 f.write(f"{os.getpid()}\n")
 
-        from qwen3_pretrain import train as entry
+        try:
+            # Monarch imports torch when it starts this process, before RANK/LOCAL_RANK
+            # are set, so workers.yaml turns torch's device auto-load off (else all 16
+            # processes would initialize Neuron at once, without a rank). Load
+            # torch-neuronx now, with this rank's identity, which also registers the
+            # "neuron" compile backend.
+            import torch_neuronx  # noqa: F401
 
-        sys.argv = ["train.py", *args]
-        entry.main(list(args))
+            # Now TorchTitan (imported by m1_shape's demo modules) sees the Neuron
+            # device; see qwen3_pretrain/__init__.py.
+            from qwen3_pretrain import m1_shape  # noqa: F401
+            from qwen3_pretrain import train as entry
+
+            sys.argv = ["train.py", *args]
+            entry.main(list(args))
+        except BaseException:
+            # The controller only gets a one-line summary, and ranks other than 0 log
+            # to files in the pod: write what to debug with to the pod log.
+            import traceback
+
+            examples = sys.modules.get("examples")
+            os.write(
+                pod_log,
+                (
+                    f"replica {replica} rank {rank} FAILED:\n{traceback.format_exc()}"
+                    f"examples module: {examples} {getattr(examples, '__path__', None)}\n"
+                    f"sys.path: {sys.path}\n"
+                ).encode(),
+            )
+            # Plain text to the controller: it cannot rebuild the demo trainer's
+            # exception classes (it does not have that code).
+            error = sys.exc_info()[1]
+            raise RuntimeError(
+                f"replica {replica} rank {rank}: {type(error).__name__}: {error}"
+            ) from None
         if rank == 0:
             open(COMPLETED_MARK, "w").close()

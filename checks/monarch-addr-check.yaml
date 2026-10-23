@@ -1,0 +1,73 @@
+# One-off: which worker identity forms Monarch 0.8 accepts. For each candidate, starts
+# a worker on service<ID>@tcp://POD_IP:PORT in a subprocess, attaches to the same
+# string, spawns 2 procs and calls an endpoint. No Neuron devices.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: monarch-addr-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  containers:
+  - name: check
+    image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+      value: "0"
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+    command:
+    - /bin/bash
+    - -c
+    - |
+      cat > /tmp/worker.py <<'EOF'
+      import sys
+      from monarch.actor import enable_transport, run_worker_loop_forever
+      enable_transport(f"tcp://{sys.argv[2]}:0")
+      run_worker_loop_forever(ca="trust_all_connections", address=sys.argv[1])
+      EOF
+      cat > /tmp/client.py <<'EOF'
+      import sys
+      from monarch.actor import Actor, endpoint, attach_to_workers, enable_transport
+
+      class Echo(Actor):
+          @endpoint
+          def ok(self) -> int:
+              return 1
+
+      enable_transport(f"tcp://{sys.argv[2]}:0")
+      host = attach_to_workers(ca="trust_all_connections", workers=[sys.argv[1]])
+      host.initialized.get()
+      procs = host.spawn_procs(per_host={"procs": 2})
+      print("RESULT OK", sys.argv[1], list(procs.spawn("echo", Echo).ok.call().get()))
+      EOF
+      PORT=26600
+      for ID in qwen3worker1 2 2MuAHeDjLCEd; do
+        PORT=$((PORT + 1))
+        ADDR="service<${ID}>@tcp://${POD_IP}:${PORT}"
+        echo "=== $ADDR"
+        /opt/py312/bin/python /tmp/worker.py "$ADDR" "$POD_IP" >/tmp/w-$ID.log 2>&1 &
+        sleep 5
+        timeout 60 /opt/py312/bin/python /tmp/client.py "$ADDR" "$POD_IP" 2>&1 | grep -E "RESULT|Error|error" | head -3
+        kill %1 2>/dev/null; wait 2>/dev/null
+        tail -2 /tmp/w-$ID.log
+      done
+      echo "=== done"
+    resources:
+      requests:
+        cpu: "4"
+        memory: 16Gi
+      limits:
+        cpu: "8"
+        memory: 16Gi

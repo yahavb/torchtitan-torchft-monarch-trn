@@ -4,8 +4,12 @@
 interruption and stay ready, while Kubernetes replaces the failed one and it rejoins.
 
 Files: `lighthouse.yaml`, `job.yaml`, `qwen3_pretrain/`.
-Who does what: **Kubernetes** replaces a failed pod (its Job); **torchft** keeps the
-others training and heals the replacement. No controller.
+Who does what: **Kubernetes** replaces a failed pod (its Job): the pod exits on a crash,
+and fails its liveness check on a hang (no training step for 120 s). **torchft** keeps
+the others training and heals the replacement. No controller.
+
+Image: the public Neuron image; an init container builds torchft, the Neuron torchft
+trainer and TorchTitan, pinned (see the README).
 
 ## 1. The setup (1 min)
 
@@ -16,10 +20,10 @@ others training and heals the replacement. No controller.
 - The replicas average gradients over EFA RDMA (torchft's Neuron process group).
 
 ```
-kubectl apply -f lighthouse.yaml
 kubectl create configmap qwen3-pretrain-code --from-file=qwen3_pretrain/ --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f lighthouse.yaml
 kubectl apply -f job.yaml
-kubectl get po -w            # pods turn 1/1 once step 1 commits (~5 min)
+kubectl get po -w            # deps init (~1-2 min), then 1/1 once step 1 commits
 ```
 
 ## 2. Healthy training (2 min)

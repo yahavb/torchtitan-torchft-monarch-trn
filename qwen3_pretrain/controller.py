@@ -27,6 +27,7 @@ import uuid
 import monarch.actor
 from monarch.actor import attach_to_workers, enable_transport
 
+from qwen3_pretrain.monarch_worker import worker_address
 from qwen3_pretrain.replica_actor import LOCAL_RANKS, PodHealth, ReplicaTrainer
 
 REPLICAS = int(os.environ.get("NNODES", "4"))
@@ -62,19 +63,19 @@ monarch.actor.unhandled_fault_hook = _fault_hook
 
 
 async def _worker_address(replica: int, failed: set[str]) -> str:
-    """tcp://IP:port of replica's worker pod once it is listening, skipping
+    """The Monarch address of replica's worker pod once it is listening, skipping
     addresses of pods marked failed: after a failure this waits for the pod
     Kubernetes brings back (a new IP)."""
     host = f"{WORKER_SERVICE}-{replica}.{WORKER_SERVICE}"
     while True:
         try:
             ip = socket.gethostbyname(host)
-            if f"tcp://{ip}:{WORKER_PORT}" in failed:
+            if worker_address(replica, ip, WORKER_PORT) in failed:
                 await asyncio.sleep(RETRY_DELAY_S)
                 continue
             _, writer = await asyncio.wait_for(asyncio.open_connection(ip, WORKER_PORT), 5)
             writer.close()
-            return f"tcp://{ip}:{WORKER_PORT}"
+            return worker_address(replica, ip, WORKER_PORT)
         except (OSError, asyncio.TimeoutError):
             await asyncio.sleep(RETRY_DELAY_S)
 

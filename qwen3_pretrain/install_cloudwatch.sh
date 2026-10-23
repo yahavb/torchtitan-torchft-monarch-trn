@@ -3,7 +3,7 @@
 # into /tmp/cw-pkgs, which callers APPEND to PYTHONPATH: any of its dependencies the
 # image already has (urllib3, ...) keep the image's version.
 set -euo pipefail
-PY=/opt/torch-neuronx/.venv/bin/python
+PY="${PY:-/usr/local/bin/python3}"
 if "$PY" -c 'import boto3' 2>/dev/null; then
   echo "boto3 already in the image"
   exit 0

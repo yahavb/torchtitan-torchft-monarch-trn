@@ -1,0 +1,57 @@
+# Builds images/torch-neuronx-py312/Dockerfile with kaniko (no Docker daemon) and pushes
+# it to public ECR. Before applying:
+#   kubectl create configmap torch-neuronx-py312-context \
+#     --from-file=images/torch-neuronx-py312/Dockerfile --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl create secret docker-registry ecr-public-push --docker-server=public.ecr.aws \
+#     --docker-username=AWS --docker-password="$(aws ecr-public get-login-password --region us-east-1)"
+# (the ECR Public token is valid for 12 hours: recreate the secret for a later build).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: build-torch-neuronx-py312
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:v1.23.2
+    args:
+    - --dockerfile=/context/Dockerfile
+    - --context=dir:///context
+    - --destination=public.ecr.aws/e6d8z6l9/torch-neuronx-py312:2.14.0-neuronx-py312-sdk2.33.0-ubuntu26.04
+    # One layer at the end: the base is large and every RUN would otherwise be snapshotted.
+    - --single-snapshot
+    - --snapshot-mode=redo
+    - --compressed-caching=false
+    resources:
+      requests:
+        cpu: "32"
+        memory: 96Gi
+        ephemeral-storage: 300Gi
+      limits:
+        cpu: "32"
+        memory: 96Gi
+        ephemeral-storage: 300Gi
+    volumeMounts:
+    - name: context
+      mountPath: /context
+    - name: push-auth
+      mountPath: /kaniko/.docker
+  volumes:
+  - name: context
+    configMap:
+      name: torch-neuronx-py312-context
+  - name: push-auth
+    secret:
+      secretName: ecr-public-push
+      items:
+      - key: .dockerconfigjson
+        path: config.json

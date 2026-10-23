@@ -13,6 +13,7 @@ The demo hardcodes its shape (4 hosts x 64 ranks); m1_shape.py resizes it to
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import fields, replace
 from typing import Any
@@ -20,6 +21,7 @@ from typing import Any
 # m1_shape first: it must resize the demo before the demo modules load.
 from qwen3_pretrain import m1_shape  # isort: skip
 
+import examples.kubernetes.neuron_m1.neuron_attention as _m1_attention
 import examples.kubernetes.neuron_m1.trainer as _m1_trainer
 from examples.kubernetes.neuron_m1.checkpoint import NeuronCheckpointManager
 from examples.kubernetes.neuron_m1.frontier import TransitionError
@@ -74,6 +76,46 @@ def _publish_frontier(self: Any, phase: str) -> None:
 
 NeuronFaultTolerantTrainer._publish_frontier = _publish_frontier
 
+# The demo's Neuron attention adapter checks that torch.compile, flex_attention and
+# create_block_mask have EXACTLY the torch 2.13 parameters; torch 2.14 differs
+# (torch.compile lost shapes_spec), which fails the check though the adapter does not
+# use those parameters. Keep a guard against real drift: for torch.compile, the
+# parameters the adapter passes must exist; for the others, every expected
+# parameter must exist with the same kind. Added parameters are allowed and logged.
+_original_validate_parameters = _m1_attention._validate_parameters
+# Parameters the adapter actually passes, per checked callable (neuron_attention.py's
+# install_neuron_attention); for these only the used ones must exist.
+_USED_PARAMETERS = {"torch.compile": {"model", "backend", "options"}}
+
+
+def _validate_parameters(target: Any, *, label: str, expected: tuple) -> None:
+    try:
+        actual = tuple(
+            (p.name, p.kind) for p in inspect.signature(target).parameters.values()
+        )
+    except (TypeError, ValueError):
+        return _original_validate_parameters(target, label=label, expected=expected)
+    names = {name for name, _ in actual}
+    if label in _USED_PARAMETERS:
+        # Only what the adapter passes has to exist (it calls
+        # torch.compile(fn, backend=..., options=...)); log other differences.
+        missing = sorted(_USED_PARAMETERS[label] - names)
+        removed = [name for name, _ in expected if name not in names]
+        if removed and not missing:
+            logger.info(f"neuron attention: {label} no longer has {removed}; unused, allowed")
+    else:
+        missing = [p for p in expected if p not in actual]
+    if missing:
+        raise _m1_attention.NeuronAttentionContractError(
+            f"{label} signature drifted: missing or changed {missing}"
+        )
+    added = [name for name, _ in actual if name not in {n for n, _ in expected}]
+    if added:
+        logger.info(f"neuron attention: {label} has new parameters {added}; allowed")
+
+
+_m1_attention._validate_parameters = _validate_parameters
+
 # A rejoiner replays the dataloader up to the cohort's committed step, so the
 # replay bound must cover the whole run (the demo's Image 14 note).
 _MAX_STEPS = 10000
@@ -109,6 +151,9 @@ def qwen3_14b_c4() -> NeuronFaultTolerantTrainer.Config:
     values.update(
         {
             "hf_assets_path": _TOKENIZER,
+            # TorchTitan's outputs (structured logs, ...) default to ./outputs in its
+            # checkout, which is read-only here (the deps volume).
+            "dump_folder": os.environ.get("QWEN3_DUMP_FOLDER", "/tmp/torchtitan-outputs"),
             "dataloader": HuggingFaceTextDataLoader.Config(
                 dataset=_DATASET,
                 infinite=True,

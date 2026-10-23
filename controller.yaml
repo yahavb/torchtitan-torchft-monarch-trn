@@ -18,7 +18,7 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
-      # On a trn3-dev1 node only because the image (13.8 GB) is cached there.
+      # On a trn3-dev1 node: the workers' image is cached there.
       nodeSelector:
         node-type: trn3-dev1
       tolerations:
@@ -35,15 +35,16 @@ spec:
           type: RuntimeDefault
       containers:
       - name: controller
-        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
         imagePullPolicy: IfNotPresent
         command:
         - /bin/bash
         - -c
         - |
           set -euo pipefail
-          bash /opt/qwen3-pretrain/qwen3_pretrain/install_monarch.sh
-          exec /opt/torch-neuronx/.venv/bin/python -m qwen3_pretrain.controller "$@"
+          # Monarch is in the image's Python 3.12 env; only this repo's code is added.
+          export PYTHONPATH="/opt/qwen3-pretrain${PYTHONPATH:+:$PYTHONPATH}"
+          exec /opt/py312/bin/python -m qwen3_pretrain.controller "$@"
         - controller
         # Training arguments, passed to every replica (~5.5 s/step: 5000 steps ~8 h).
         args: ["--training.steps", "5000"]
@@ -63,8 +64,6 @@ spec:
           value: "1"
         - name: TORCH_DEVICE_BACKEND_AUTOLOAD
           value: "0"
-        - name: PYTHONPATH
-          value: /opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/monarch-pkgs
         - name: PYTHONUNBUFFERED
           value: "1"
         - name: PYTHONDONTWRITEBYTECODE

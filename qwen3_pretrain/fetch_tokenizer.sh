@@ -5,7 +5,7 @@
 set -euo pipefail
 [ "${QWEN3_DATASET:-c4}" = c4_test ] && { echo "c4_test: using the test tokenizer"; exit 0; }
 DIR="${QWEN3_TOKENIZER_DIR:-/tmp/hf/Qwen3-14B}"
-/opt/torch-neuronx/.venv/bin/python - "$DIR" <<'EOF'
+"${PY:-/usr/local/bin/python3}" - "$DIR" <<'EOF'
 import sys
 from huggingface_hub import snapshot_download
 

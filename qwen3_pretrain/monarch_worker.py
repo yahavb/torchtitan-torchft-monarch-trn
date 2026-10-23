@@ -21,6 +21,16 @@ import time
 from monarch.actor import enable_transport, run_worker_loop_forever
 
 PORT = int(os.environ.get("MONARCH_WORKER_PORT", "26600"))
+
+
+def worker_address(replica: int, ip: str, port: int = PORT) -> str:
+    """The worker's Monarch address, shared by the worker and the controller.
+
+    Monarch 0.8 attaches by ProcAddr, service<ID>@tcp://host:port, where ID must
+    be the worker's identity: a base58 uid (a fixed small number works; a name
+    does not -- checks/monarch-addr-check.yaml). ID = replica index + 2.
+    """
+    return f"service<{replica + 2}>@tcp://{ip}:{port}"
 COMPLETED_MARK = "/run/torchft-neuron-m1/qwen3-training-completed"
 
 
@@ -52,8 +62,9 @@ def main() -> None:
     threading.Thread(target=_exit_when_completed, daemon=True).start()
     # Callbacks from the controller arrive on this address.
     enable_transport(f"tcp://{pod_ip}:0")
-    _log(f"monarch worker listening on tcp://{pod_ip}:{PORT}")
-    run_worker_loop_forever(ca="trust_all_connections", address=f"tcp://{pod_ip}:{PORT}")
+    address = worker_address(int(os.environ["JOB_COMPLETION_INDEX"]), pod_ip)
+    _log(f"monarch worker listening on {address}")
+    run_worker_loop_forever(ca="trust_all_connections", address=address)
 
 
 if __name__ == "__main__":
