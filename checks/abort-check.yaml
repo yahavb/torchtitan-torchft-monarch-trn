@@ -1,0 +1,64 @@
+# One-off: does an image's torch-neuronx cancel RDMA transfers to a dead peer?
+# The internal demo image's custom torch-neuronx advertised
+# efa-rdm-device-write-mr-abort-v1 (RdmaManager.cc) and torchft survivors kept training;
+# public torch-neuronx 2.14 has no write-mr-abort and survivors hit the 120 s timeout.
+# Greps the torch-neuronx install for it, and prints Python / package versions.
+# No Neuron devices used. Set the image to check below.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: abort-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - key: aws.amazon.com/neuron
+    operator: Equal
+    value: "true"
+    effect: NoSchedule
+  containers:
+  - name: check
+    image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+    imagePullPolicy: IfNotPresent
+    env:
+    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+      value: "0"
+    command:
+    - /bin/bash
+    - -c
+    - |
+      echo "=== python"
+      for p in $(command -v python3 python 2>/dev/null) /opt/*/bin/python /workspace/*/.venv/bin/python; do
+        [ -x "$p" ] && echo "$p: $($p -V 2>&1)"
+      done
+      PY=$(command -v python3)
+      for p in /workspace/*/.venv/bin/python /opt/*/.venv/bin/python; do [ -x "$p" ] && PY=$p && break; done
+      echo "using $PY"
+      echo "=== packages"
+      $PY - <<'EOF'
+      import importlib.metadata as m, importlib.util as u
+      for name in ("torch", "torch-neuronx", "torchft", "torchmonarch", "torchtitan", "torchtitan-neuron", "neuronx-cc"):
+          try:
+              print(f"{name}: {m.version(name)}")
+          except m.PackageNotFoundError:
+              print(f"{name}: NOT INSTALLED")
+      s = u.find_spec("torch_neuronx")
+      print("torch_neuronx at:", s.origin if s else None)
+      EOF
+      echo "=== write-mr-abort in torch-neuronx?"
+      TNX=$($PY -c 'import importlib.util as u, os; s = u.find_spec("torch_neuronx"); print(os.path.dirname(s.origin) if s else "")')
+      for d in "$TNX" /workspace; do
+        [ -n "$d" ] && [ -d "$d" ] && grep -rla "write-mr-abort" "$d" 2>/dev/null | head -5
+      done
+      if [ -n "$TNX" ] && grep -rqa "write-mr-abort" "$TNX" 2>/dev/null; then echo "ABORT SUPPORT: YES"; else echo "ABORT SUPPORT: NO"; fi
+      echo "=== done"
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "4"
+        memory: 16Gi

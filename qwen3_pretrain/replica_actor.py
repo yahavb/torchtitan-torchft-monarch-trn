@@ -29,10 +29,15 @@ HEARTBEAT = os.path.join(RUN_DIR, "qwen3-heartbeat.json")
 FAILED_MARK = os.path.join(RUN_DIR, "qwen3-failed")
 COMPLETED_MARK = os.path.join(RUN_DIR, "qwen3-training-completed")
 
-# What the deps init container built (workers.yaml), first on the path. Monarch 0.8
+# Where the demo trainer, TorchTitan and torchft are (QWEN3_DEPS_PATHS; default: the
+# deps init container's build), first on the path. Monarch
 # ships its own top-level `examples` package, which otherwise shadows the demo
 # trainer's examples.kubernetes.neuron_m1 in the processes Monarch spawns.
-_DEPS_PATHS = ("/deps/torchft-examples", "/deps/torchtitan", "/deps/site")
+_DEPS_PATHS = tuple(
+    os.environ.get(
+        "QWEN3_DEPS_PATHS", "/deps/torchft-examples:/deps/torchtitan:/deps/site"
+    ).split(":")
+)
 
 
 def _use_deps_paths() -> None:

@@ -1,7 +1,9 @@
-# Monarch controller (qwen3_pretrain/controller.py), the brain: tells the 4 worker
-# pods (workers.yaml) to train, watches each replica, and decides when one must
-# restart (crash or hang). It marks that pod failed; the pod's liveness probe fails
-# and Kubernetes restarts it; then the controller tells the new pod to train. CPU only.
+# Monarch controller (qwen3_pretrain/controller.py), the single controller: runs
+# torchft's Lighthouse as an actor, tells the 4 worker pods (workers.yaml) to train,
+# and recovers failed replicas per failure type -- fast in-place restart of the
+# replica's process mesh first, then reallocation (it marks the pod failed and
+# Kubernetes restarts it). CPU only. Replaces lighthouse.yaml: its Service below
+# takes the qwen3-lighthouse name, so delete the lighthouse Deployment first.
 # It owns the training processes, so if it dies, training stops: backoffLimit 0.
 # Training arguments are the controller's args.
 apiVersion: batch/v1
@@ -35,16 +37,20 @@ spec:
           type: RuntimeDefault
       containers:
       - name: controller
-        image: public.ecr.aws/e6d8z6l9/torch-neuronx-py312@sha256:c35c778cf6718e3256a37158d5242487713d7613aaf3192669bd6595ee1ca63e
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
         imagePullPolicy: IfNotPresent
         command:
         - /bin/bash
         - -c
         - |
           set -euo pipefail
-          # Monarch is in the image's Python 3.12 env; only this repo's code is added.
-          export PYTHONPATH="/opt/qwen3-pretrain${PYTHONPATH:+:$PYTHONPATH}"
-          exec /opt/py312/bin/python -m qwen3_pretrain.controller "$@"
+          export PYTHONPATH="/opt/qwen3-pretrain:/tmp/monarch-pkgs${PYTHONPATH:+:$PYTHONPATH}"
+          bash /opt/qwen3-pretrain/qwen3_pretrain/install_monarch.sh
+          # The Lighthouse actor logs here too: same readable summary as lighthouse.yaml
+          # (a line per quorum change, not per request).
+          set -o pipefail
+          /opt/torch-neuronx/.venv/bin/python -u -m qwen3_pretrain.controller "$@" 2>&1 \
+            | /opt/torch-neuronx/.venv/bin/python -u /opt/qwen3-pretrain/qwen3_pretrain/lighthouse_log.py
         - controller
         # Training arguments, passed to every replica (~5.5 s/step: 5000 steps ~8 h).
         args: ["--training.steps", "5000"]
@@ -54,6 +60,16 @@ spec:
             fieldRef:
               fieldPath: status.podIP
         - name: NNODES
+          value: "4"
+        # Recovery per failure type: fast in-place restarts per pod, then reallocation.
+        - name: QWEN3_INPLACE_RESTARTS
+          value: "2"
+        - name: QWEN3_HANG_RECOVERY
+          value: restart
+        # torchft Lighthouse, run as a Monarch actor in this pod (lighthouse_actor.py).
+        - name: LIGHTHOUSE_MIN_REPLICAS
+          value: "3"
+        - name: LIGHTHOUSE_INITIAL_REPLICAS
           value: "4"
         - name: WORKER_SERVICE
           value: qwen3-workers
@@ -70,6 +86,9 @@ spec:
           value: "1"
         - name: HOME
           value: /tmp/home
+        ports:
+        - name: lighthouse
+          containerPort: 29510
         resources:
           requests:
             cpu: "2"
@@ -94,3 +113,17 @@ spec:
       - name: scratch
         emptyDir:
           sizeLimit: 10Gi
+---
+# The replicas' TORCHFT_LIGHTHOUSE address, now served by the controller's actor.
+apiVersion: v1
+kind: Service
+metadata:
+  name: qwen3-lighthouse
+  namespace: default
+spec:
+  selector:
+    app: qwen3-controller
+  ports:
+  - name: http
+    port: 29510
+    targetPort: lighthouse

@@ -190,6 +190,8 @@ def qwen3_14b_c4() -> NeuronFaultTolerantTrainer.Config:
                 backend="neuron",
             ),
             "debug": replace(base.debug, seed=_SEED),
+            # Metrics (and the METRICS line, CloudWatch) every step, not every 10.
+            "metrics": replace(base.metrics, log_freq=int(os.environ.get("QWEN3_LOG_FREQ", "1"))),
             # Keep training with 1 of 2 replicas (lighthouse --min_replicas 1).
             "fault_tolerance": NeuronTorchFTManager.Config(
                 enable=True,

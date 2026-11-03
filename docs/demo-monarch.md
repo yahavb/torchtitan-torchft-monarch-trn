@@ -8,15 +8,23 @@ Files: `lighthouse.yaml`, `workers.yaml`, `controller.yaml`, `qwen3_pretrain/`.
 Image: this repo's `torch-neuronx-py312` (the public Neuron DLC + Python 3.12 + Monarch).
 The timings below were measured on the earlier internal image (Python 3.12, Monarch 0.4.1).
 
-## Who detects, who decides, who recovers
+## The design: the PyTorch Monarch blog's fault-tolerance case study
 
-- **Kubernetes (EKS)** starts every pod, gives the workers their devices, and is the
-  only one that recovers: it restarts a pod whose liveness check fails.
-- **The Monarch controller** is the brain. The worker pods wait for it to tell them to
-  train. It watches each replica and decides when one must restart (a crash, or a hang),
-  then marks that pod failed. The pod's liveness check fails on the mark, and Kubernetes
-  restarts it. The same controller pattern drives GRPO (`generate`, `forward_backward`).
-- **torchft** keeps the other replicas training, and heals the restarted one from a peer.
+- **Single controller** (`controller.yaml`): the control plane, including **torchft's
+  Lighthouse, as a Monarch actor** in the controller pod.
+- Each replica is a **replica group**: a Monarch process mesh of 16 training processes
+  in its worker pod. The worker pods wait for the controller to tell them to train.
+- **Fault detection** with Monarch's primitives: a failed train call (crash), plus the
+  step heartbeat (hang).
+- **Recovery per failure type, cheapest first:**
+  1. **fast restart in place**: a new process mesh in the same pod, keeping the
+     allocation (devices) -- up to `QWEN3_INPLACE_RESTARTS` (2) times;
+  2. **escalate to reallocation**: the controller marks the pod failed, its liveness
+     probe fails, Kubernetes restarts it, and a new mesh joins in the new pod. Also when
+     the pod itself is gone (device-taint eviction, node loss).
+     `QWEN3_HANG_RECOVERY=reallocate` sends hangs straight here.
+- **torchft keeps the healthy replicas stepping** throughout, and heals each new
+  replica group from a healthy peer.
 
 ## 1. The setup (1 min)
 
@@ -28,8 +36,8 @@ The timings below were measured on the earlier internal image (Python 3.12, Mona
 - The **lighthouse** (CPU pod) tells the replicas, every step, who is alive.
 
 ```
+kubectl delete deploy qwen3-lighthouse --ignore-not-found   # the controller serves it now
 kubectl create configmap qwen3-pretrain-code --from-file=qwen3_pretrain/ --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f lighthouse.yaml
 kubectl apply -f workers.yaml
 kubectl apply -f controller.yaml
 kubectl get po -w            # deps init (~1-2 min), then 1/1 once step 1 commits

@@ -23,13 +23,26 @@ from monarch.actor import enable_transport, run_worker_loop_forever
 PORT = int(os.environ.get("MONARCH_WORKER_PORT", "26600"))
 
 
+def _monarch_version() -> tuple[int, ...]:
+    import importlib.metadata as metadata
+
+    try:
+        version = metadata.version("torchmonarch")
+    except metadata.PackageNotFoundError:
+        return (0,)
+    return tuple(int(part) for part in version.split(".")[:2] if part.isdigit())
+
+
 def worker_address(replica: int, ip: str, port: int = PORT) -> str:
     """The worker's Monarch address, shared by the worker and the controller.
 
+    Monarch 0.4 (the internal image) uses a plain channel URL, tcp://host:port.
     Monarch 0.8 attaches by ProcAddr, service<ID>@tcp://host:port, where ID must
     be the worker's identity: a base58 uid (a fixed small number works; a name
     does not -- checks/monarch-addr-check.yaml). ID = replica index + 2.
     """
+    if _monarch_version() < (0, 8):
+        return f"tcp://{ip}:{port}"
     return f"service<{replica + 2}>@tcp://{ip}:{port}"
 COMPLETED_MARK = "/run/torchft-neuron-m1/qwen3-training-completed"
 
