@@ -127,6 +127,10 @@ spec:
         # inject a fault (~6.6 s/step at 4 replicas: 5000 steps is ~9 h).
         args: ["--training.steps", "5000"]
         env:
+        # non-root container: the patch cannot replace /opt/aws/neuron/bin/neuron-monitor-top.py,
+        # so put it first on PATH (kubectl exec sessions inherit this) # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
+        - name: PATH
+          value: "/opt/neuron-top-patch:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/amazon/efa/bin:/home/.openmpi/bin"
         - name: JOB_NAME
           value: qwen3-pretrain
         - name: PY
@@ -295,7 +299,7 @@ spec:
           mountPath: /dev/shm
       volumes:
       - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
-        configMap: {name: neuron-top-patch, optional: true}
+        configMap: {name: neuron-top-patch, optional: true, defaultMode: 0755}
       - name: code
         configMap:
           name: qwen3-pretrain-code

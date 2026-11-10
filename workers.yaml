@@ -80,6 +80,10 @@ spec:
           echo "monarch worker for torchft replica ${JOB_COMPLETION_INDEX} of ${NNODES}"
           exec "$PY" -m qwen3_pretrain.monarch_worker
         env:
+        # non-root container: the patch cannot replace /opt/aws/neuron/bin/neuron-monitor-top.py,
+        # so put it first on PATH (kubectl exec sessions inherit this) # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
+        - name: PATH
+          value: "/opt/neuron-top-patch:/opt/aws/neuron/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/amazon/efa/bin:/home/.openmpi/bin"
         - name: PY
           value: /opt/torch-neuronx/.venv/bin/python
         - name: POD_IP
@@ -258,7 +262,7 @@ spec:
           mountPath: /dev/shm
       volumes:
       - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
-        configMap: {name: neuron-top-patch, optional: true}
+        configMap: {name: neuron-top-patch, optional: true, defaultMode: 0755}
       - name: code
         configMap:
           name: qwen3-pretrain-code
