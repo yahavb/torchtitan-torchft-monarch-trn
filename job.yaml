@@ -50,6 +50,39 @@ spec:
       resourceClaims:
       - name: accelerators
         resourceClaimTemplateName: l-lnc2-trn-efa
+      initContainers:
+      # NIXL data plane (TORCHFT_NEURON_TRANSPORT=nixl): build NIXL once per node into
+      # the node cache with lingbot-world-v2's tools/nixl/build_nixl.sh (ConfigMap
+      # nixl-build), and lay torchft fork commit acaf137 (ProcessGroupNixl; ConfigMap
+      # torchft-nixl) over the image's torchft. Root only for apt in build_nixl.sh.
+      - name: nixl
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          export PATH="/opt/torch-neuronx/.venv/bin:$PATH" NIXL_CACHE=/node-cache/nixl
+          eval "$(bash /opt/nixl-build/build_nixl.sh)"
+          echo "nixl: $NIXL_PLUGIN_DIR"
+          # hwloc is a runtime dependency; the non-root trainer cannot apt it.
+          mkdir -p /node-cache/nixl/hwloc
+          cp -a /usr/lib/x86_64-linux-gnu/libhwloc.so.15* /node-cache/nixl/hwloc/
+          cp -a /usr/local/lib/python3.12/site-packages/torchft /overlay/
+          cp -a /opt/torchft-neuron/examples /overlay/
+          cd /overlay
+          if command -v patch >/dev/null; then patch -p1 --forward < /opt/torchft-nixl/acaf137.patch
+          else git apply -p1 /opt/torchft-nixl/acaf137.patch; fi
+          echo "torchft overlay: acaf137 applied"
+        volumeMounts:
+        - {name: node-cache, mountPath: /node-cache}
+        - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+        - {name: torchft-nixl, mountPath: /opt/torchft-nixl, readOnly: true}
+        - {name: torchft-overlay, mountPath: /overlay}
       containers:
       - name: trainer
         # The internal torchft demo image (Image 14): torch-neuronx with RDMA abort
@@ -68,7 +101,10 @@ spec:
           set -euo pipefail
           # This repo's code, the demo trainer and TorchTitan (in the image), then
           # CloudWatch's boto3; ahead of the image's own path.
-          export PYTHONPATH="/opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/cw-pkgs${PYTHONPATH:+:$PYTHONPATH}"
+          # NIXL (built by the nixl init container) and the torchft acaf137 overlay.
+          eval "$(NIXL_CACHE=/node-cache/nixl bash /opt/nixl-build/build_nixl.sh 2>/dev/null)"
+          export LD_LIBRARY_PATH="/node-cache/nixl/hwloc:$LD_LIBRARY_PATH"
+          export PYTHONPATH="/opt/torchft-overlay:/opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/cw-pkgs${PYTHONPATH:+:$PYTHONPATH}"
           bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
           bash /opt/qwen3-pretrain/qwen3_pretrain/fetch_tokenizer.sh
           # Each pod is its own torchrun world and one torchft replica. The demo's
@@ -164,6 +200,9 @@ spec:
           value: "16"
         - name: TORCHFT_NEURON_MAX_GENERATIONS
           value: "65536"
+        # Cross-replica data plane: nixl (torchft/nixl.py) or neuron (native RDMA).
+        - name: TORCHFT_NEURON_TRANSPORT
+          value: nixl
         - name: TORCHFT_NEURON_M1_POD_UID
           valueFrom:
             fieldRef:
@@ -297,6 +336,9 @@ spec:
           mountPath: /tmp
         - name: dev-shm
           mountPath: /dev/shm
+        - {name: node-cache, mountPath: /node-cache, readOnly: true}
+        - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+        - {name: torchft-overlay, mountPath: /opt/torchft-overlay, readOnly: true}
       volumes:
       - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
         configMap: {name: neuron-top-patch, optional: true, defaultMode: 0755}
@@ -312,3 +354,11 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 64Gi
+      - name: node-cache
+        hostPath: {path: /opt/torchft-nixl-cache, type: DirectoryOrCreate}
+      - name: nixl-build
+        configMap: {name: nixl-build}
+      - name: torchft-nixl
+        configMap: {name: torchft-nixl}
+      - name: torchft-overlay
+        emptyDir: {}

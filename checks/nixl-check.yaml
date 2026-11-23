@@ -1,0 +1,85 @@
+# NIXL on the training image: build it (lingbot-world-v2 tools/nixl/build_nixl.sh,
+# unchanged, from ConfigMap nixl-build) into the node cache, then check what
+# torchft/nixl.py needs: torch-neuronx's nrt capsule, the image's torchft
+# helpers, and a loopback NIXL WRITE into Neuron memory.
+#   kubectl create configmap nixl-build --from-file=$HOME/lingbot-world-v2/tools/nixl/build_nixl.sh
+#   kubectl create configmap torchft-nixl --from-file=$HOME/torchft/torchft/nixl.py
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-check
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - {key: aws.amazon.com/neuron, operator: Equal, value: "true", effect: NoSchedule}
+  resourceClaims:
+  - name: accelerators
+    resourceClaimTemplateName: l-lnc2-trn-efa
+  containers:
+  - name: check
+    image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
+    resources:
+      claims:
+      - name: accelerators
+    env:
+    - {name: NIXL_CACHE, value: /node-cache/nixl}
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -euo pipefail
+      export PATH="/opt/torch-neuronx/.venv/bin:$PATH"
+      python3 --version
+      eval "$(bash /opt/nixl-build/build_nixl.sh)"
+      echo "nixl: $NIXL_PLUGIN_DIR"
+      export PYTHONPATH="/opt/torchft-nixl:/opt/torchft-neuron:/opt/torchtitan${PYTHONPATH:+:$PYTHONPATH}"
+      python3 - <<'EOF'
+      import importlib.util, os, sys, time
+      import torch, torch_neuronx, torchft
+      print("torchft", torchft.__file__)
+      print("nrt capsule:", hasattr(torch_neuronx._C, "_get_nrt_tensor_capsule"))
+      # nixl.py as a submodule of the image's torchft: its imports must resolve.
+      spec = importlib.util.spec_from_file_location("torchft.nixl", "/opt/torchft-nixl/nixl.py")
+      nx = importlib.util.module_from_spec(spec); sys.modules["torchft.nixl"] = nx
+      spec.loader.exec_module(nx)
+      print("torchft.nixl imports OK")
+      nixl_agent, cfg = nx._nixl_api()
+      dev = torch.device("neuron", torch_neuronx.current_device())
+      n = 64 << 20
+      src = torch.arange(n // 4, dtype=torch.float32, device=dev)
+      dst = torch.zeros(n // 4, dtype=torch.float32, device=dev)
+      torch_neuronx.synchronize()
+      sva, dva = nx._nrt_va(src), nx._nrt_va(dst)
+      d = dev.index
+      a = nixl_agent("chk-a", cfg(backends=["LIBFABRIC"]))
+      b = nixl_agent("chk-b", cfg(backends=["LIBFABRIC"]))
+      a.register_memory(a.get_reg_descs([(sva, n, d, "")], "VRAM"))
+      b.register_memory(b.get_reg_descs([(dva, n, d, "")], "VRAM"))
+      peer = a.add_remote_agent(b.get_agent_metadata())
+      h = a.initialize_xfer("WRITE", a.get_xfer_descs([(sva, n, d)], "VRAM"),
+                            a.get_xfer_descs([(dva, n, d)], "VRAM"), peer, b"done")
+      t0 = time.perf_counter(); st = a.transfer(h)
+      while st not in ("DONE", "ERR"):
+          st = a.check_xfer_state(h)
+      ms = (time.perf_counter() - t0) * 1e3
+      got = set()
+      while b"done" not in got:
+          for m in b.get_new_notifs().values(): got.update(m)
+      ok = torch.equal(src.cpu(), dst.cpu())
+      print(f"loopback WRITE {n >> 20} MiB: {st} in {ms:.1f} ms, data match {ok}")
+      sys.exit(0 if st == "DONE" and ok else 1)
+      EOF
+    volumeMounts:
+    - {name: node-cache, mountPath: /node-cache}
+    - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+    - {name: torchft-nixl, mountPath: /opt/torchft-nixl, readOnly: true}
+  volumes:
+  - name: node-cache
+    hostPath: {path: /opt/torchft-nixl-cache, type: DirectoryOrCreate}
+  - name: nixl-build
+    configMap: {name: nixl-build}
+  - name: torchft-nixl
+    configMap: {name: torchft-nixl}
