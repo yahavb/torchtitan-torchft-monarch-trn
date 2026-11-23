@@ -74,11 +74,43 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop: ["ALL"]
+      # NIXL data plane (TORCHFT_NEURON_TRANSPORT=nixl): build NIXL once per node into
+      # the node cache with lingbot-world-v2's tools/nixl/build_nixl.sh (ConfigMap
+      # nixl-build), and lay torchft fork nixl-transport @ 4def5f3 (ProcessGroupNixl + nixl_link; ConfigMap
+      # torchft-nixl) over the image's torchft. Root only for apt in build_nixl.sh.
+      - name: nixl
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
+        securityContext:
+          runAsUser: 0
+          runAsNonRoot: false
+          allowPrivilegeEscalation: false
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -euo pipefail
+          export PATH="/opt/torch-neuronx/.venv/bin:$PATH" NIXL_CACHE=/node-cache/nixl
+          eval "$(bash /opt/nixl-build/build_nixl.sh)"
+          echo "nixl: $NIXL_PLUGIN_DIR"
+          # hwloc is a runtime dependency; the non-root trainer cannot apt it.
+          mkdir -p /node-cache/nixl/hwloc
+          cp -a /usr/lib/x86_64-linux-gnu/libhwloc.so.15* /node-cache/nixl/hwloc/
+          cp -a /usr/local/lib/python3.12/site-packages/torchft /overlay/
+          cp -a /opt/torchft-neuron/examples /overlay/
+          cd /overlay
+          if command -v patch >/dev/null; then patch -p1 --forward < /opt/torchft-nixl/acaf137.patch
+          else git apply -p1 /opt/torchft-nixl/acaf137.patch; fi
+          echo "torchft overlay: nixl-transport 4def5f3 applied"
+        volumeMounts:
+        - {name: node-cache, mountPath: /node-cache}
+        - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+        - {name: torchft-nixl, mountPath: /opt/torchft-nixl, readOnly: true}
+        - {name: torchft-overlay, mountPath: /overlay}
       containers:
       - name: trainer
         # The torchft demo's worker image (Image 14). Used for its environment only:
         # torch-neuronx venv, TorchTitan 1ac46539 at /opt/torchtitan (the WORKDIR),
-        # EFA/libfabric, and the Neuron attention adapter. torchft is in it but unused.
+        # EFA/libfabric, and the Neuron attention adapter. torchft comes from the nixl overlay.
         # Proven on trn2; this is its first use on trn3-dev1.
         image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
         imagePullPolicy: IfNotPresent
@@ -93,7 +125,10 @@ spec:
           # This repo's code, the demo trainer and TorchTitan (in the image), Monarch
           # (installed next) and CloudWatch's boto3; the training processes Monarch
           # spawns inherit it.
-          export PYTHONPATH="/opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/monarch-pkgs:/tmp/cw-pkgs${PYTHONPATH:+:$PYTHONPATH}"
+          # NIXL (built by the nixl init container) and the torchft nixl-transport overlay.
+          eval "$(NIXL_CACHE=/node-cache/nixl bash /opt/nixl-build/build_nixl.sh 2>/dev/null)"
+          export LD_LIBRARY_PATH="/node-cache/nixl/hwloc:$LD_LIBRARY_PATH"
+          export PYTHONPATH="/opt/torchft-overlay:/opt/qwen3-pretrain:/opt/torchft-neuron:/opt/torchtitan:/tmp/monarch-pkgs:/tmp/cw-pkgs${PYTHONPATH:+:$PYTHONPATH}"
           bash /opt/qwen3-pretrain/qwen3_pretrain/install_monarch.sh
           bash /opt/qwen3-pretrain/qwen3_pretrain/install_cloudwatch.sh || true
           bash /opt/qwen3-pretrain/qwen3_pretrain/fetch_tokenizer.sh
@@ -123,8 +158,9 @@ spec:
         # torchft timeouts, as in the demo.
         - name: TORCHFT_TIMEOUT_SEC
           value: "120"
+        # 1800 (demo: 600): replicas scheduled minutes apart must still meet in one quorum.
         - name: TORCHFT_QUORUM_TIMEOUT_SEC
-          value: "600"
+          value: "1800"
         - name: TORCHFT_CONNECT_TIMEOUT_SEC
           value: "60"
         - name: TORCHFT_QUORUM_RETRIES
@@ -141,6 +177,9 @@ spec:
           value: "16"
         - name: TORCHFT_NEURON_MAX_GENERATIONS
           value: "65536"
+        # Cross-replica data plane: nixl (torchft/nixl.py) or neuron (native RDMA).
+        - name: TORCHFT_NEURON_TRANSPORT
+          value: nixl
         - name: TORCHFT_NEURON_M1_POD_UID
           valueFrom:
             fieldRef:
@@ -196,7 +235,7 @@ spec:
           value: "1"
         # Where the demo trainer and TorchTitan are (replica_actor.py puts them first).
         - name: QWEN3_DEPS_PATHS
-          value: /opt/torchft-neuron:/opt/torchtitan
+          value: /opt/torchft-overlay:/opt/torchft-neuron:/opt/torchtitan
         # 256 MiB allocator split cap: the demo's fix for device-memory growth.
         - name: TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG
           value: kMaxSplitSizeBytes=268435456
@@ -280,6 +319,9 @@ spec:
           mountPath: /tmp
         - name: dev-shm
           mountPath: /dev/shm
+        - {name: node-cache, mountPath: /node-cache, readOnly: true}
+        - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+        - {name: torchft-overlay, mountPath: /opt/torchft-overlay, readOnly: true}
       volumes:
       - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
         configMap: {name: neuron-top-patch, optional: true, defaultMode: 0755}
@@ -295,6 +337,14 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 64Gi
+      - name: node-cache
+        hostPath: {path: /opt/torchft-nixl-cache, type: DirectoryOrCreate}
+      - name: nixl-build
+        configMap: {name: nixl-build}
+      - name: torchft-nixl
+        configMap: {name: torchft-nixl}
+      - name: torchft-overlay
+        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
