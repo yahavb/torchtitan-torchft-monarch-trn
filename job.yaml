@@ -53,7 +53,7 @@ spec:
       initContainers:
       # NIXL data plane (TORCHFT_NEURON_TRANSPORT=nixl): build NIXL once per node into
       # the node cache with lingbot-world-v2's tools/nixl/build_nixl.sh (ConfigMap
-      # nixl-build), and lay torchft fork commit acaf137 (ProcessGroupNixl; ConfigMap
+      # nixl-build), and lay torchft fork nixl-transport @ 4def5f3 (ProcessGroupNixl + nixl_link; ConfigMap
       # torchft-nixl) over the image's torchft. Root only for apt in build_nixl.sh.
       - name: nixl
         image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
@@ -77,7 +77,7 @@ spec:
           cd /overlay
           if command -v patch >/dev/null; then patch -p1 --forward < /opt/torchft-nixl/acaf137.patch
           else git apply -p1 /opt/torchft-nixl/acaf137.patch; fi
-          echo "torchft overlay: acaf137 applied"
+          echo "torchft overlay: nixl-transport 4def5f3 applied"
         volumeMounts:
         - {name: node-cache, mountPath: /node-cache}
         - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
