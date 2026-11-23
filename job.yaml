@@ -182,8 +182,9 @@ spec:
         # torchft timeouts, as in the demo.
         - name: TORCHFT_TIMEOUT_SEC
           value: "120"
+        # 1800 (demo: 600): replicas scheduled minutes apart must still meet in one quorum.
         - name: TORCHFT_QUORUM_TIMEOUT_SEC
-          value: "600"
+          value: "1800"
         - name: TORCHFT_CONNECT_TIMEOUT_SEC
           value: "60"
         - name: TORCHFT_QUORUM_RETRIES
