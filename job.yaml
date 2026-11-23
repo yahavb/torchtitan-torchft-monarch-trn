@@ -204,6 +204,13 @@ spec:
         # Cross-replica data plane: nixl (torchft/nixl.py) or neuron (native RDMA).
         - name: TORCHFT_NEURON_TRANSPORT
           value: nixl
+        # NIXL arena sized for this run (default is 8 replicas, 1.34 GB per rank,
+        # which ran a heal source out of device memory): 4 replicas, and a small
+        # checkpoint slot (healing writes tensors directly; the slot is fallback only).
+        - name: TORCHFT_NIXL_MAX_WORLD_SIZE
+          value: "4"
+        - name: TORCHFT_NIXL_CKPT_SLOT_BYTES
+          value: "16777216"
         - name: TORCHFT_NEURON_M1_POD_UID
           valueFrom:
             fieldRef:
