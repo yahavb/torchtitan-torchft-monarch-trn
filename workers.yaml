@@ -1,4 +1,4 @@
-# Monarch version of job.yaml: four worker pods = four torchft replicas on trn3-dev1.
+# Monarch version of job.yaml: four worker pods = four torchft replicas on one trn2.48xlarge.
 # Same image, devices, env and readiness as job.yaml, but each pod runs only a
 # Monarch worker and waits for controller.yaml's controller to tell it to train.
 # The controller decides when a replica must restart and marks its pod failed; the
@@ -54,13 +54,33 @@ spec:
       resourceClaims:
       - name: accelerators
         resourceClaimTemplateName: l-lnc2-trn-efa
+      # Gate training on a quick matmul health check of this pod's own chips.
+      # Runs in-process, so it sees only the devices allocated by the claim.
+      initContainers:
+      - name: neuron-healthcheck
+        image: public.ecr.aws/neuron/neuron-observer:0.2.0
+        command: ["sh", "-c"]
+        args:
+        - |
+          ls /dev/neuron*
+          neuron-observer health-check --test matmul
+        env:
+        - name: NEURON_RT_ALLOW_LEGACY_NEFF
+          value: "1"
+        resources:
+          claims:
+          - name: accelerators
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
       containers:
       - name: trainer
         # The torchft demo's worker image (Image 14). Used for its environment only:
         # torch-neuronx venv, TorchTitan 1ac46539 at /opt/torchtitan (the WORKDIR),
         # EFA/libfabric, and the Neuron attention adapter. torchft is in it but unused.
         # Proven on trn2; this is its first use on trn3-dev1.
-        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
         imagePullPolicy: IfNotPresent
         # TorchTitan resolves its test assets relative to its checkout.
         workingDir: /opt/torchtitan
@@ -232,16 +252,16 @@ spec:
           claims:
           - name: accelerators
           # Proportional to the claim: 4 of the node's 16 Neuron devices = 1/4 of its
-          # allocatable (trn3-dev1: 191450m CPU, 2004269Mi memory, 1842Gi ephemeral),
+          # allocatable (trn2: 191450m CPU, 1998Gi memory, 1798Gi ephemeral),
           # rounded down.
           requests:
             cpu: "47"
             memory: 489Gi
-            ephemeral-storage: 460Gi
+            ephemeral-storage: 440Gi
           limits:
             cpu: "47"
             memory: 489Gi
-            ephemeral-storage: 460Gi
+            ephemeral-storage: 440Gi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

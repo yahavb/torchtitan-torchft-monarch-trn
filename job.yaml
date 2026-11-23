@@ -56,7 +56,7 @@ spec:
         # support (efa-rdm-device-write-mr-abort-v1), which survivors need to cancel
         # transfers to a dead peer; public torch-neuronx 2.14 lacks it (DEMO.md).
         # torchft, its Neuron trainer and TorchTitan are in the image.
-        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:0e55895fd7717c415ce93aa824dd34084f1b16595e3f176292be6e8637319bfe
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
         imagePullPolicy: IfNotPresent
         # TorchTitan resolves its test assets relative to its checkout.
         workingDir: /opt/torchtitan
