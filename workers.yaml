@@ -94,7 +94,7 @@ spec:
           echo "nixl: $NIXL_PLUGIN_DIR"
           # hwloc is a runtime dependency; the non-root trainer cannot apt it.
           mkdir -p /node-cache/nixl/hwloc
-          cp -a /usr/lib/x86_64-linux-gnu/libhwloc.so.15* /node-cache/nixl/hwloc/
+          cp -af /usr/lib/x86_64-linux-gnu/libhwloc.so.15* /node-cache/nixl/hwloc/ 2>/dev/null || test -e /node-cache/nixl/hwloc/libhwloc.so.15   # pods on one node race here
           cp -a /usr/local/lib/python3.12/site-packages/torchft /overlay/
           cp -a /opt/torchft-neuron/examples /overlay/
           cd /overlay
