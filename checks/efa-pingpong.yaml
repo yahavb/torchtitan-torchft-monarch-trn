@@ -1,0 +1,57 @@
+# EFA between the two trn3-dev1 nodes: one idle pod per node (training image,
+# l-lnc2-trn-efa claim: 4 Neuron + 4 EFA), then fi_pingpong driven by kubectl exec:
+#   server: fi_pingpong -p efa -e rdm -B 47592
+#   client: fi_pingpong -p efa -e rdm -P 47592 <server-pod-ip>
+# Also used for the cross-node NIXL write test (checks/nixl_xnode.py): NIXL from the
+# node cache, built by lingbot's build_nixl.sh (ConfigMap nixl-build).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: efa-pp
+  namespace: default
+spec:
+  replicas: 2
+  podManagementPolicy: Parallel
+  serviceName: efa-pp
+  selector:
+    matchLabels: {app: efa-pp}
+  template:
+    metadata:
+      labels: {app: efa-pp}
+    spec:
+      nodeSelector:
+        node-type: trn3-dev1
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: {app: efa-pp}
+            topologyKey: kubernetes.io/hostname
+      tolerations:
+      - {key: aws.amazon.com/neuron, operator: Equal, value: "true", effect: NoSchedule}
+      resourceClaims:
+      - name: accelerators
+        resourceClaimTemplateName: l-lnc2-trn-efa
+      containers:
+      - name: pp
+        image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
+        command: ["sleep", "infinity"]
+        securityContext: {runAsUser: 0}
+        volumeMounts:
+        - {name: node-cache, mountPath: /node-cache}
+        - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+        env:
+        - {name: PATH, value: "/opt/amazon/efa/bin:/usr/local/bin:/usr/bin:/bin"}
+        - {name: LD_LIBRARY_PATH, value: "/opt/aws/neuron/lib:/opt/amazon/efa/lib"}
+        - {name: FI_PROVIDER, value: efa}
+        - {name: FI_EFA_FORK_SAFE, value: "1"}
+        - {name: FI_EFA_USE_DEVICE_RDMA, value: "1"}
+        - {name: FI_HMEM, value: system}
+        resources:
+          claims:
+          - name: accelerators
+      volumes:
+      - name: node-cache
+        hostPath: {path: /opt/torchft-nixl-cache, type: DirectoryOrCreate}
+      - name: nixl-build
+        configMap: {name: nixl-build}
