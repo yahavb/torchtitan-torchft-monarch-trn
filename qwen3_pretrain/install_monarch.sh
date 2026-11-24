@@ -7,8 +7,9 @@
 # Callers append /tmp/monarch-pkgs to PYTHONPATH.
 set -euo pipefail
 PY=/opt/torch-neuronx/.venv/bin/python
+# MONARCH_VERSION=0.6.0 for the upstream-torchft path (torchstore needs it).
 "$PY" -m pip install --quiet --no-deps --target /tmp/monarch-pkgs \
-  torchmonarch==0.4.1 \
+  "torchmonarch==${MONARCH_VERSION:-0.4.1}" \
   Flask==3.1.3 blinker==1.9.0 click-option-group==0.5.9 cloudpickle==3.1.2 \
   clusterscope==0.0.32 docker==7.2.0 itsdangerous==2.2.0 lark==1.3.1 \
   mypy_extensions==1.1.0 py-spy==0.4.2 pyre-extensions==0.0.32 pyzmq==27.2.0 \

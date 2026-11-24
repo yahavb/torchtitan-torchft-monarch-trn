@@ -31,11 +31,14 @@ class LighthouseActor(Actor):
             from torchft._torchft import LighthouseServer
 
         if self._server is None:
-            self._server = LighthouseServer(
+            kwargs = dict(
                 bind=bind,
                 min_replicas=min_replicas,
-                initial_replicas=initial_replicas,
                 join_timeout_ms=join_timeout_ms,
                 quorum_tick_ms=quorum_tick_ms,
             )
+            try:  # the torchft-neuron fork's Lighthouse also waits for the initial set
+                self._server = LighthouseServer(initial_replicas=initial_replicas, **kwargs)
+            except TypeError:  # upstream torchft
+                self._server = LighthouseServer(**kwargs)
         return self._server.address()

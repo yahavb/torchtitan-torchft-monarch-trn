@@ -16,7 +16,6 @@ import time
 
 import torch
 import torch.distributed as dist
-from examples.kubernetes.neuron_m1.trainer import NeuronFaultTolerantTrainer as Trainer
 from torchtitan.tools.logging import logger
 
 _EVERY = int(os.environ.get("GRADSYNC_LOG_EVERY", "100"))
@@ -26,7 +25,7 @@ def _local(t: torch.Tensor) -> torch.Tensor:
     return t.to_local() if hasattr(t, "to_local") else t
 
 
-def _log(trainer: Trainer) -> None:
+def _log(trainer) -> None:
     ft = trainer.config.fault_tolerance
 
     params = [p for m in trainer.model_parts for p in m.parameters()]
@@ -60,6 +59,9 @@ def _beat(step: int) -> None:
 def install() -> None:
     """Wrap Trainer.train_step: a GRADSYNC line every logged step, and the
     readiness heartbeat after every step."""
+    from qwen3_pretrain.trainer_class import trainer_class
+
+    Trainer = trainer_class()
     original = Trainer.train_step
 
     def train_step(self, *args, **kwargs):

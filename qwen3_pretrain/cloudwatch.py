@@ -135,7 +135,9 @@ def install() -> None:
     except ImportError as error:
         _warn_once("hook", f"no TorchTitan MetricsProcessor ({error}); metrics are off")
         return
-    from examples.kubernetes.neuron_m1.trainer import NeuronFaultTolerantTrainer  # noqa: PLC0415
+    from qwen3_pretrain.trainer_class import trainer_class  # noqa: PLC0415
+
+    NeuronFaultTolerantTrainer = trainer_class()
 
     original_log = MetricsProcessor.log
 

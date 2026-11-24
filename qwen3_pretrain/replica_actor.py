@@ -54,6 +54,7 @@ def _use_deps_paths() -> None:
 def _identity_env(replica: int, worker_inc: str, process_inc: str) -> dict[str, str]:
     """The demo trainer's per-launch identity (set in job.yaml's command before)."""
     return {
+        "QWEN3_REPLICA_ID": str(replica),
         "TORCHFT_NEURON_M1_LOGICAL_SLOT": str(replica),
         "TORCHFT_NEURON_M1_REPLICA_ID": f"torchft-neuron-m1-replica-{replica}",
         "TORCHFT_NEURON_TRANSPORT_SLOT": str(replica),
@@ -89,9 +90,16 @@ class ReplicaTrainer(Actor):
     @endpoint
     def prepare(self, replica: int, worker_inc: str, process_inc: str) -> None:
         _use_deps_paths()
+        os.environ.update(_identity_env(replica, worker_inc, process_inc))
+        if os.environ.get("QWEN3_TORCHFT", "upstream") != "fork":
+            for name in ("qwen3-heartbeat.json", "torchrun.pid"):
+                try:
+                    os.unlink(os.path.join(RUN_DIR, name))
+                except FileNotFoundError:
+                    pass
+            return
         from examples.kubernetes.neuron_m1.launcher import DEFAULT_SENTINEL, claim_launch
 
-        os.environ.update(_identity_env(replica, worker_inc, process_inc))
         for name in ("launch.json", "qwen3-heartbeat.json", "torchrun.pid"):
             try:
                 os.unlink(os.path.join(RUN_DIR, name))
@@ -153,7 +161,8 @@ class ReplicaTrainer(Actor):
 
             # Now TorchTitan (imported by m1_shape's demo modules) sees the Neuron
             # device; see qwen3_pretrain/__init__.py.
-            from qwen3_pretrain import m1_shape  # noqa: F401
+            if os.environ.get("QWEN3_TORCHFT", "upstream") == "fork":
+                from qwen3_pretrain import m1_shape  # noqa: F401
             from qwen3_pretrain import train as entry
 
             sys.argv = ["train.py", *args]
