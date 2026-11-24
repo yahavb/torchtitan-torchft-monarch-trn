@@ -80,7 +80,11 @@ def qwen3_14b_c4() -> NeuronFTTrainer.Config:
                 pipeline_parallel_degree=1,
                 context_parallel_degree=1,
             ),
-            "checkpoint": TorchFTCheckpointManager.Config(**_values(base.checkpoint)),
+            # Disk checkpoints are off; TorchTitan's per-replica dataloader checkpoints
+            # would load from a folder that is only set when they are on.
+            "checkpoint": TorchFTCheckpointManager.Config(
+                **_values(base.checkpoint), enable_ft_dataloader_checkpoints=False
+            ),
             "activation_checkpoint": FullAC.Config(),
             "compile": replace(
                 base.compile, enable=True, components=["model", "loss"], backend="neuron"
