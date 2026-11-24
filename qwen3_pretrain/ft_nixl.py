@@ -30,6 +30,9 @@ def install() -> None:
     def manager(*args, pg, **kwargs):
         transport = NixlCheckpointTransport(pg, timeout=heal_timeout)
         kwargs.setdefault("checkpoint_transport", transport)
+        # Advertise an address other pods can reach (the pod IP), not the pod name.
+        if os.environ.get("TORCHFT_ADVERTISED_HOST"):
+            kwargs.setdefault("hostname", os.environ["TORCHFT_ADVERTISED_HOST"])
         instance = upstream_manager(*args, pg=pg, **kwargs)
         # Receive in place into this replica's live state.
         transport.set_state_dict(instance._manager_state_dict)
