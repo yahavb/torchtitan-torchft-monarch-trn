@@ -1,0 +1,42 @@
+# TorchStore's NIXL transport on Neuron: one idle pod (training image, 4 Neuron + 4 EFA),
+# NIXL from the node cache (lingbot's build_nixl.sh, ConfigMap nixl-build). The torchstore
+# source is copied in with kubectl cp and run by hand:
+#   kubectl cp ~/torchstore torchstore-neuron:/opt/torchstore
+apiVersion: v1
+kind: Pod
+metadata:
+  name: torchstore-neuron
+  namespace: default
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    node-type: trn3-dev1
+  tolerations:
+  - {key: aws.amazon.com/neuron, operator: Equal, value: "true", effect: NoSchedule}
+  resourceClaims:
+  - name: accelerators
+    resourceClaimTemplateName: l-lnc2-trn-efa
+  containers:
+  - name: test
+    image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/torchft-neuron-m1@sha256:49b1e734f8049167a780a60346952e32ea722c81433782a49762bc21c16cd1b9
+    command: ["sleep", "infinity"]
+    securityContext: {runAsUser: 0}
+    env:
+    - {name: NIXL_CACHE, value: /node-cache/nixl}
+    - {name: TORCHSTORE_NIXL_ENABLED, value: "1"}
+    - {name: TORCHSTORE_NIXL_BACKEND, value: LIBFABRIC}
+    - {name: FI_PROVIDER, value: efa}
+    - {name: FI_EFA_USE_DEVICE_RDMA, value: "1"}
+    - {name: FI_EFA_FORK_SAFE, value: "1"}
+    - {name: NEURON_LOGICAL_NC_CONFIG, value: "2"}
+    resources:
+      claims:
+      - name: accelerators
+    volumeMounts:
+    - {name: node-cache, mountPath: /node-cache}
+    - {name: nixl-build, mountPath: /opt/nixl-build, readOnly: true}
+  volumes:
+  - name: node-cache
+    hostPath: {path: /opt/torchft-nixl-cache, type: DirectoryOrCreate}
+  - name: nixl-build
+    configMap: {name: nixl-build}
