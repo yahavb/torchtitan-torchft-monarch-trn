@@ -17,6 +17,7 @@ from typing import Any
 from qwen3_pretrain import ft_nixl
 from qwen3_pretrain.neuron_attention import install_neuron_attention
 from torchtitan.components.loss import ChunkedLossWrapper
+from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
@@ -52,6 +53,24 @@ class NeuronFTTrainer(FaultTolerantTrainer):
             if lm_head is not None:
                 self.loss_fn.set_lm_head(lm_head)
                 model._skip_lm_head = True
+
+
+    def init_distributed(self) -> ParallelDims:
+        """TorchTitan's FT init_distributed without its ``ranks=`` list.
+
+        Upstream derives the global ranks as ``replica_id * group_size + i``, with
+        ``group_size`` the replica count, so a 16-rank replica's process group got 4
+        global ranks it does not have and the Neuron collectives failed ("Invalid
+        NEFF, instruction, or input" in the first allgather). Each pod is its own
+        world here; torchft joins the replicas.
+        """
+        dist_utils.init_distributed(
+            self.config.comm,
+            enable_cpu_backend=self.config.training.enable_cpu_offload,
+            base_folder=self.config.dump_folder,
+        )
+        self.ft_manager = self.config.fault_tolerance.build()
+        return ParallelDims.from_config(self.config.parallelism, int(os.environ["WORLD_SIZE"]))
 
 
 def _values(config: Any) -> dict[str, Any]:
