@@ -86,7 +86,7 @@ spec:
           allowPrivilegeEscalation: false
         env:
         - {name: TORCHFT_UPSTREAM_REF, value: 3a55d02}
-        - {name: TORCHSTORE_REF, value: e7b9cab}
+        - {name: TORCHSTORE_REF, value: 91bf5ec}
         command:
         - /bin/bash
         - -c
@@ -186,7 +186,7 @@ spec:
         - name: MONARCH_VERSION
           value: "0.6.0"
         - {name: TORCHFT_UPSTREAM_REF, value: 3a55d02}
-        - {name: TORCHSTORE_REF, value: e7b9cab}
+        - {name: TORCHSTORE_REF, value: 91bf5ec}
         - name: TORCHFT_NEURON_TRANSPORT
           value: nixl
         # NIXL arena sized for this run (default is 8 replicas, 1.34 GB per rank,
