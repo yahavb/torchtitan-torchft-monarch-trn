@@ -36,6 +36,11 @@ def install() -> None:
         # thread's: "NRT model scheduling failed, Invalid NEFF, instruction, or input".
         if os.environ.get("QWEN3_ASYNC_QUORUM", "0") != "1":
             kwargs["use_async_quorum"] = False
+        # No weight sync at step 0: every replica starts from the same seed (as the
+        # fork's demo did), and at step 0 the optimizer state does not exist yet, so
+        # building the heal source's state dict failed in a Neuron allgather.
+        if os.environ.get("QWEN3_INIT_SYNC", "0") != "1":
+            kwargs["init_sync"] = False
         # Advertise an address other pods can reach (the pod IP), not the pod name.
         if os.environ.get("TORCHFT_ADVERTISED_HOST"):
             kwargs.setdefault("hostname", os.environ["TORCHFT_ADVERTISED_HOST"])
