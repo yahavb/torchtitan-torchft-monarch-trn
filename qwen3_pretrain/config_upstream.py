@@ -80,10 +80,17 @@ def qwen3_14b_c4() -> NeuronFTTrainer.Config:
                 pipeline_parallel_degree=1,
                 context_parallel_degree=1,
             ),
-            # Disk checkpoints are off; TorchTitan's per-replica dataloader checkpoints
-            # would load from a folder that is only set when they are on.
+            # TorchTitan gives the torchft Manager its state (model, optimizer, LR,
+            # train state: what a healing replica receives) only when checkpointing
+            # is on. On, but never due: no disk saves; no per-replica dataloader ones.
             "checkpoint": TorchFTCheckpointManager.Config(
-                **_values(base.checkpoint), enable_ft_dataloader_checkpoints=False
+                **{
+                    **_values(base.checkpoint),
+                    "enable": True,
+                    "interval": 10**9,
+                    "folder": "checkpoint",
+                },
+                enable_ft_dataloader_checkpoints=False,
             ),
             "activation_checkpoint": FullAC.Config(),
             "compile": replace(
