@@ -11,11 +11,14 @@ one 16-rank world (TP4 x FSDP4) and one torchft replica.
 from __future__ import annotations
 
 import os
+
+import torch
 from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from qwen3_pretrain import ft_nixl
 from qwen3_pretrain.neuron_attention import install_neuron_attention
+from torchtitan.components.checkpoint import LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.distributed.activation_checkpoint import FullAC
@@ -53,6 +56,53 @@ class NeuronFTTrainer(FaultTolerantTrainer):
             if lm_head is not None:
                 self.loss_fn.set_lm_head(lm_head)
                 model._skip_lm_head = True
+        self._heal_from_raw_parameters()
+
+    def _heal_from_raw_parameters(self) -> None:
+        """Heal with the parameters as they live on device, not ``model.state_dict()``.
+
+        torchft picks the heal source per group rank, so only some ranks of a source
+        replica send. TorchTitan's fused-QKV state dict hook redistributes a DTensor
+        over the FSDP group; run on those ranks alone, it mismatched the others'
+        collectives ("replica group signature mismatch", then "Invalid NEFF"). The raw
+        parameters need no collectives, and the receiver heals into them in place.
+        """
+        manager = self.ft_manager.manager if self.ft_manager.enabled else None
+        if manager is None or not self.checkpointer.enable:
+            return
+        states = self.checkpointer.states
+        modules = list(self.model_parts)
+
+        def raw_model() -> dict[str, Any]:
+            out: dict[str, Any] = {}
+            for module in modules:
+                out.update((n, p.detach()) for n, p in module.named_parameters())
+                out.update((n, b.detach()) for n, b in module.named_buffers())
+            return out
+
+        def state_dict() -> dict[str, Any]:
+            ret = {MODEL: raw_model()}
+            for key in (OPTIMIZER, LR_SCHEDULER, TRAIN_STATE):
+                if key in states:
+                    ret[key] = states[key].state_dict()
+            return ret
+
+        def load_state_dict(state: dict[str, Any]) -> None:
+            live = raw_model()
+            with torch.no_grad():
+                for name, src in state[MODEL].items():
+                    dst = live[name]
+                    a = getattr(dst, "_local_tensor", dst)
+                    b = getattr(src, "_local_tensor", src)
+                    if a.untyped_storage().data_ptr() != b.untyped_storage().data_ptr():
+                        a.copy_(b)
+            for key, value in state.items():
+                if key != MODEL:
+                    states[key].load_state_dict(value)
+
+        manager._user_state_dicts.pop("set_state_dict_fns", None)
+        manager._load_state_dict_fns.pop("set_state_dict_fns", None)
+        manager.register_state_dict_fn("neuron_raw", load_state_dict, state_dict)
 
 
     def init_distributed(self) -> ParallelDims:
