@@ -20,7 +20,9 @@ import sys
 STEADY_EVERY = int(os.environ.get("LIGHTHOUSE_STEADY_EVERY", "100"))
 CHATTER = ("Received quorum request", "New quorum not ready", "Valid quorum with", "Fast quorum found")
 QUORUM_ID = re.compile(r"Quorum! Quorum \{ quorum_id: (\d+)")
-REPLICA = re.compile(r'replica_id: "[^"]*?-(\d+):')
+# Replica ids end in the replica index before the ":<uuid>": "...-3:" (the fork's
+# demo) or "torchtitan_ft_3:" (TorchTitan's torchft integration).
+REPLICA = re.compile(r'replica_id: "[^"]*?[-_](\d+):')
 
 
 def main() -> None:
