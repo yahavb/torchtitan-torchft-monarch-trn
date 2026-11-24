@@ -30,6 +30,12 @@ def install() -> None:
     def manager(*args, pg, **kwargs):
         transport = NixlCheckpointTransport(pg, timeout=heal_timeout)
         kwargs.setdefault("checkpoint_transport", transport)
+        # Quorum and healing on the training thread (sync quorum). With async quorum
+        # the heal source builds its state dict on torchft's quorum thread, which on
+        # Neuron runs collectives (allgathers) concurrently with the training
+        # thread's: "NRT model scheduling failed, Invalid NEFF, instruction, or input".
+        if os.environ.get("QWEN3_ASYNC_QUORUM", "0") != "1":
+            kwargs["use_async_quorum"] = False
         # Advertise an address other pods can reach (the pod IP), not the pod name.
         if os.environ.get("TORCHFT_ADVERTISED_HOST"):
             kwargs.setdefault("hostname", os.environ["TORCHFT_ADVERTISED_HOST"])
