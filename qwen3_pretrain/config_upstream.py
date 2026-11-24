@@ -11,6 +11,7 @@ one 16-rank world (TP4 x FSDP4) and one torchft replica.
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 from dataclasses import dataclass, fields, replace
@@ -39,6 +40,9 @@ _TOKENIZER = (
 )
 
 
+from torchtitan.tools.logging import logger  # noqa: E402
+
+
 class NeuronFTTrainer(FaultTolerantTrainer):
     """TorchTitan's FaultTolerantTrainer plus the two Neuron bindings."""
 
@@ -57,6 +61,56 @@ class NeuronFTTrainer(FaultTolerantTrainer):
                 self.loss_fn.set_lm_head(lm_head)
                 model._skip_lm_head = True
         self._heal_from_raw_parameters()
+
+    def train(self):
+        self._warm_up_before_join()
+        return super().train()
+
+    def _warm_up_before_join(self) -> None:
+        """Build this replica's training graphs before it joins a quorum.
+
+        Neuron compiles and loads the forward and backward graphs on their first
+        call. A rejoining replica did that on its first step after the heal (over
+        2 min), with the survivors blocked in the gradient allreduce until the
+        controller's hang check killed them. One local forward/backward, with the
+        cross-replica gradient hook off, moves that before the join. No optimizer
+        step, so parameters are unchanged; the gradients are dropped.
+        """
+        from torch.distributed.fsdp import FSDPModule
+        from torchtitan.components.loss import IGNORE_INDEX
+
+        if not self.ft_manager.enabled or os.environ.get("QWEN3_WARMUP_BEFORE_JOIN", "1") == "0":
+            return
+        started = time.monotonic()
+
+        def set_hook(hook) -> None:
+            for part in self.model_parts:
+                part.apply(lambda m: m.set_all_reduce_hook(hook) if isinstance(m, FSDPModule) else None)
+
+        input_dict, labels = next(self.batch_generator(self.dataloader))
+        local_valid_tokens = (labels != IGNORE_INDEX).sum()
+        if self.parallel_dims.dp_enabled:
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens.to(self.device), self.parallel_dims.get_mesh("batch")
+            )
+        else:
+            global_valid_tokens = float(local_valid_tokens.item())
+        input_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in input_dict.items()}
+        set_hook(lambda output: None)
+        try:
+            loss = self.forward_backward_step(
+                input_dict=input_dict, labels=labels.to(self.device), global_valid_tokens=global_valid_tokens
+            )
+            torch.accelerator.synchronize()
+            del loss
+        finally:
+            self.ft_manager.maybe_set_all_reduce_hook(self.model_parts)
+        for part in self.model_parts:
+            part.zero_grad(set_to_none=True)
+        import torch_neuronx
+
+        torch_neuronx.empty_cache()
+        logger.info("warm-up before join: local forward/backward built in %.1f s", time.monotonic() - started)
 
     def _heal_from_raw_parameters(self) -> None:
         """Heal with the parameters as they live on device, not ``model.state_dict()``.
